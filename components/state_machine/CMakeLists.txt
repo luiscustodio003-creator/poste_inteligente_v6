@@ -4,8 +4,8 @@ idf_component_register(
     REQUIRES
         dali_manager
         comm_manager
-        radar_manager
         config
         esp_timer
+        freertos
         log
 )

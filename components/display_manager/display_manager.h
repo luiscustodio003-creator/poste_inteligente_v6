@@ -1,86 +1,72 @@
 /* ============================================================
-   DISPLAY MANAGER -- DECLARACAO
-   ------------------------------------------------------------
-   @file      display_manager.h
-   @brief     Gestao do display ST7789 com LVGL 8.3
-   @version   5.0
-   @date      2026-03-15
-
+   DISPLAY MANAGER — DECLARACAO
+   ============================================================
    Projecto  : Poste Inteligente
+   Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
 
-   Alteracoes (v4.0 -> v5.0):
-   --------------------------
-   1. Adicionada display_manager_update_brightness() -- mostra
-      o brilho actual da luminaria em percentagem no display.
-      Essencial para o operador saber o estado da luminaria:
-        IDLE      -> LIGHT_MIN  (10%)
-        DETECTION -> 55%        ((100+10)/2)
-        LIGHT_ON  -> LIGHT_MAX  (100%)
-        TIMEOUT   -> LIGHT_MIN  (10%)
-        SAFE_MODE -> LIGHT_SAFE (50%) ou 100% se veiculo
-   2. Label de brilho com cor dinamica:
-        verde  = brilho maximo (100%)
-        ambar  = brilho intermedio (11-99%)
-        cinza  = brilho minimo (<=10%)
+   Descricao:
+   ----------
+   Gestao do display TFT ST7789 240x240 com LVGL 8.3.
+   Mostra em tempo real todas as informacoes do poste:
+   estado da linha, vizinhos ESQ/DIR, contadores T/Tc,
+   brilho actual, velocidade e estado FSM.
 
-   Layout do display 240x240 actualizado:
-   ----------------------------------------
-   [icone wifi]  [NOME POSTE]    <- y=5/10
-   IP: x.x.x.x                  <- y=35
-   VIZINHOS: N                   <- y=55
-   ──────────────────────────    <- separador y=73
-   P01 .4.2 OK   52km  2s        <- vizinho 1 y=80
-   P02 .4.3 OFF  --km 15s        <- vizinho 2 y=102
-   P03 .4.4 SAFE 30km  8s        <- vizinho 3 y=124
-   P04 .4.5 OK   45km  1s        <- vizinho 4 y=146
-   ──────────────────────────    <- separador y=168
-   LUZ: 50%  [SAFE MODE]         <- y=185  NOVO
-   VEL: 52 km/h                  <- y=210
+   Layout do display 240x240:
+   --------------------------
+   POSTE 01  [MASTER]          <- y=8  nome + estado linha
+   IP: 192.168.4.1             <- y=26 IP com prefixo AP/IP
+   ─────────────────────────   <- separador y=40
+   ESQ: P01 OK  | DIR: P03 OK  <- y=52 vizinhos esq/dir
+   ─────────────────────────   <- separador y=65
+   T:2  Tc:1  VEL: 72 km/h    <- y=77 contadores + velocidade
+   ─────────────────────────   <- separador y=90
+   P02 .4.2 OK   72km  2s      <- y=102 vizinho 1
+   P03 .4.3 OFF  --km 15s      <- y=122 vizinho 2
+   P04 .4.4 SAFE 50km  8s      <- y=142 vizinho 3
+   P05 .4.5 OK   45km  1s      <- y=162 vizinho 4
+   ─────────────────────────   <- separador y=178
+   LUZ: 100%  [LIGHT ON]       <- y=192 brilho + estado FSM
+   ─────────────────────────   <- separador y=208
 
    Dependencias:
    -------------
-   - st7789, lvgl 8.3, wifi_off, wifi_on
-   - udp_manager.h (neighbor_t, neighbor_status_t)
-   - FreeRTOS, lv_conf.h
+   - st7789.h, lvgl.h
+   - udp_manager.h (neighbor_t)
+   - freertos, esp_timer
 ============================================================ */
 
 #ifndef DISPLAY_MANAGER_H
 #define DISPLAY_MANAGER_H
 
 #include <stdbool.h>
+#include <stdint.h>
 #include <stddef.h>
 #include "udp_manager.h"
 
-/* Inicializa display, LVGL e todos os widgets */
-void display_manager_init(void);
+/* Inicializa display, LVGL e cria lvgl_task */
+void display_manager_start(void);
 
-/* Troca icone Wi-Fi: true=wifi_on(verde) / false=wifi_off(vermelho) */
-void display_manager_set_wifi(bool connected);
-
-/* Sinaliza modo AP: true="AP: ip" / false="IP: ip" */
+/* Actualiza prefixo IP: "AP: x.x.x.x" ou "IP: x.x.x.x" */
 void display_manager_set_ap_mode(bool ap_active, const char *ip);
 
-/* Actualiza labels principais (ip ignorado -- gerido por set_ap_mode) */
-void display_manager_update_info(const char *poste,
-                                 const char *ip,
-                                 int         vizinhos,
-                                 int         vel);
+/* Actualiza linha de vizinhos ESQ e DIR */
+void display_manager_update_neighbors_lr(const char *esq_str,
+                                          const char *dir_str);
 
-/* Actualiza tabela de vizinhos:
-   ID | IP | estado (OK/OFF/SAFE) | velocidade | tempo */
+/* Actualiza contadores T, Tc e velocidade */
+void display_manager_update_traffic(int T, int Tc, int vel_kmh);
+
+/* Actualiza tabela de vizinhos completa */
 void display_manager_update_neighbors(const neighbor_t *neighbors,
-                                      size_t            count);
+                                       size_t            count);
 
-/* Actualiza brilho da luminaria no display.
-   brightness: 0-100 (%)
-   state_name: nome do estado FSM actual ("IDLE", "LIGHT_ON",
-               "SAFE MODE", "DETECTION", "TIMEOUT")
-   Cor do label: verde=100%, ambar=11-99%, cinza<=10%          */
+/* Actualiza nome do poste e estado da linha */
+void display_manager_update_info(const char *poste_name,
+                                  const char *estado_linha);
+
+/* Actualiza brilho actual e estado FSM com cor dinamica */
 void display_manager_update_brightness(uint8_t     brightness,
-                                       const char *state_name);
-
-/* Inicializa display e cria task LVGL */
-void display_manager_start(void);
+                                        const char *state_name);
 
 #endif /* DISPLAY_MANAGER_H */

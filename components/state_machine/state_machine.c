@@ -1,93 +1,110 @@
 /* ============================================================
-   STATE MACHINE -- IMPLEMENTACAO
-   ------------------------------------------------------------
-   @file      state_machine.c
-   @brief     Maquina de estados do Poste Inteligente
-   @version   2.2
-   @date      2026-03-15
+   STATE MACHINE — IMPLEMENTACAO
+   ============================================================
+   Projecto  : Poste Inteligente
+   Estudantes: Luis Custodio | Tiago Moreno
+   Plataforma: ESP32 (ESP-IDF)
 
-   Alteracoes (v2.1 -> v2.2):
-   --------------------------
-   1. Adicionada state_machine_get_state_name() -- retorna
-      o nome legivel do estado actual para o display_manager
-      mostrar na linha "LUZ: XX%  [ESTADO]".
+   Descricao:
+   ----------
+   Implementacao completa da logica do simulador v6.
+   Contadores T e Tc controlam o acendimento e apagamento.
+   A luz nunca vai a 0% -- minimo e LIGHT_MIN (10%).
 
-   Dependencias:
-   -------------
-   - state_machine.h
-   - dali_manager.h
-   - comm_manager.h
-   - system_config.h
-   - esp_timer, esp_log
+   Fluxo principal quando radar deteta carro:
+   -------------------------------------------
+   1. Tc-- (era "a caminho", agora chegou)
+   2. T++  (esta aqui)
+   3. Acende 100%
+   4. Notifica vizinho anterior: T[prev]--
+   5. Envia TC_INC para vizinho direito: Tc[next]++
+   6. Calcula ETA e envia SPD para vizinho direito
+   7. Agenda T-- em (RADAR_DETECT_M/vel + TRAFIC_TIMEOUT_MS)
+
+   Ref simulador: simulador_v6.html
 ============================================================ */
 
 #include "state_machine.h"
 #include "dali_manager.h"
 #include "comm_manager.h"
-#include "esp_log.h"
-#include "esp_timer.h"
 #include "system_config.h"
+#include "esp_timer.h"
+#include "esp_log.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/timers.h"
 
 static const char *TAG = "FSM";
 
-static system_state_t current_state    = STATE_IDLE;
-static uint64_t       state_entered_ms = 0;
+/* -----------------------------------------------------------
+   Estado interno
+   ----------------------------------------------------------- */
+static system_state_t s_state = STATE_IDLE;
+static int            s_T     = 0;  /* Carros presentes (radar confirmou) */
+static int            s_Tc    = 0;  /* Carros a caminho (UDP informou)    */
+
+/* Timestamp do ultimo carro detectado -- para calcular timeout */
+static uint64_t s_last_detect_ms = 0;
+
+/* Flag de apagamento agendado -- evita apagar se chegou novo carro */
+static bool s_apagar_pendente = false;
+
+/* Ultima velocidade detectada */
+static float s_last_speed = 0.0f;
+
+/* ===========================================================
+   UTILITARIOS
+   =========================================================== */
 
 static uint64_t now_ms(void)
 {
     return (uint64_t)(esp_timer_get_time() / 1000ULL);
 }
 
-static uint64_t time_in_state_ms(void)
+/* Retorna nome do estado para logs e display */
+const char *state_machine_get_state_name(void)
 {
-    return now_ms() - state_entered_ms;
-}
-
-static const char *state_name(system_state_t s)
-{
-    switch (s)
+    switch (s_state)
     {
         case STATE_IDLE:      return "IDLE";
-        case STATE_DETECTION: return "DETECTION";
         case STATE_LIGHT_ON:  return "LIGHT ON";
-        case STATE_TIMEOUT:   return "TIMEOUT";
         case STATE_SAFE_MODE: return "SAFE MODE";
-        default:              return "UNKNOWN";
+        case STATE_MASTER:    return "MASTER";
+        case STATE_AUTONOMOUS:return "AUTONOMO";
+        default:              return "---";
     }
 }
 
-/* -----------------------------------------------------------
-   transition_to -- Transicao com log e notificacao
-
-   CORRECCAO v2.1: prev_state guardado ANTES de actualizar
-   current_state para a condicao de notificacao ser correcta.
-   ----------------------------------------------------------- */
-static void transition_to(system_state_t new_state, const char *reason)
+/* Aplica brilho conforme estado actual dos contadores */
+static void aplicar_brilho(void)
 {
-    system_state_t prev_state = current_state;  /* guarda ANTES */
-
-    current_state    = new_state;
-    state_entered_ms = now_ms();
-
-    ESP_LOGI(TAG, "%s -> %s | %s",
-             state_name(prev_state),
-             state_name(new_state),
-             reason);
-
-    if (new_state == STATE_SAFE_MODE)
+    if (s_T > 0 || s_Tc > 0)
     {
-        comm_send_status(NEIGHBOR_SAFE_MODE);
+        /* Ha carros presentes ou a caminho -- 100% */
+        dali_set_brightness(LIGHT_MAX);
+        s_state = STATE_LIGHT_ON;
     }
-    else if (new_state == STATE_IDLE &&
-             prev_state == STATE_SAFE_MODE)
+    else
     {
-        /* Saiu de SAFE_MODE -- comunicacao restabelecida */
-        comm_send_status(NEIGHBOR_OK);
+        /* Nenhum carro -- volta ao minimo (nunca apaga) */
+        dali_set_brightness(LIGHT_MIN);
+        s_state = STATE_IDLE;
+        s_last_speed = 0.0f;
     }
-    else if (new_state == STATE_IDLE)
+}
+
+/* Verifica se pode voltar a 10% e agenda se necessario */
+static void verificar_apagar(void)
+{
+    if (s_T <= 0 && s_Tc <= 0)
     {
-        /* Ciclo normal concluido */
-        comm_send_status(NEIGHBOR_OK);
+        /* Liga flag -- state_machine_update verificara em 5s */
+        s_apagar_pendente = true;
+        s_last_detect_ms  = now_ms();
+        ESP_LOGD(TAG, "Apagar agendado em %lums", (unsigned long)TRAFIC_TIMEOUT_MS);
+    }
+    else
+    {
+        ESP_LOGD(TAG, "Mantem 100%% T=%d Tc=%d", s_T, s_Tc);
     }
 }
 
@@ -97,83 +114,158 @@ static void transition_to(system_state_t new_state, const char *reason)
 
 void state_machine_init(void)
 {
-    current_state    = STATE_IDLE;
-    state_entered_ms = now_ms();
+    s_state          = STATE_IDLE;
+    s_T              = 0;
+    s_Tc             = 0;
+    s_last_detect_ms = 0;
+    s_apagar_pendente= false;
+    s_last_speed     = 0.0f;
+
     dali_set_brightness(LIGHT_MIN);
-    ESP_LOGI(TAG, "FSM inicializada | IDLE | Brilho=%d%%", LIGHT_MIN);
+    ESP_LOGI(TAG, "FSM iniciada | IDLE | %d%%", LIGHT_MIN);
 }
 
 /* ===========================================================
-   ACTUALIZACAO -- chamada pela fsm_task a cada 100ms
+   EVENTO: RADAR DETETA CARRO
+   -----------------------------------------------------------
+   Chamado pela fsm_task quando g_radar_event.detected == true
+   e g_radar_event.distance <= RADAR_DETECT_M.
    =========================================================== */
 
-void state_machine_update(radar_vehicle_t radar_event, bool comm_ok)
+void sm_on_radar_detect(float vel)
 {
-    float neighbor_speed = 0.0f;
-    int   neighbor_id    = -1;
-    int   neighbor_pos   = -1;
+    s_apagar_pendente = false; /* Cancela apagamento pendente */
+    s_last_detect_ms  = now_ms();
+    s_last_speed      = vel;
 
-    bool spd_received = comm_receive_vehicle(&neighbor_speed,
-                                             &neighbor_id,
-                                             &neighbor_pos);
-    if (spd_received)
+    /* Converte Tc->T: carro era "a caminho", agora chegou */
+    if (s_Tc > 0) s_Tc--;
+    s_T++;
+
+    /* Acende imediatamente a 100% */
+    dali_set_brightness(LIGHT_MAX);
+    s_state = STATE_LIGHT_ON;
+
+    ESP_LOGI(TAG, "Radar: %.1fkm/h | T=%d Tc=%d", vel, s_T, s_Tc);
+
+    /* Notifica vizinho anterior -- carro ja passou por ele (T[prev]--) */
+    comm_notify_prev_passed(vel);
+
+    /* Informa vizinho direito -- carro a caminho (Tc[next]++) */
+    comm_send_tc_inc(vel);
+
+    /* Envia SPD com ETA calculado para vizinho direito acender no momento */
+    comm_send_spd(vel);
+
+    /* Agenda decremento de T apos carro sair da zona.
+       Tempo = tempo do carro atravessar a zona do radar (RADAR_DETECT_M * 2)
+       + TRAFIC_TIMEOUT_MS de espera */
+    float speed_ms = vel > 0 ? vel / 3.6f : 5.0f;
+    uint32_t zona_ms = (uint32_t)((RADAR_DETECT_M * 2.0f / speed_ms) * 1000.0f);
+
+    ESP_LOGD(TAG, "Carro sai da zona em %lums", (unsigned long)(zona_ms + TRAFIC_TIMEOUT_MS));
+}
+
+/* ===========================================================
+   EVENTO: RECEBEU TC_INC VIA UDP
+   -----------------------------------------------------------
+   Vizinho anterior detectou carro a caminho.
+   Incrementa Tc e acende 100% antecipadamente.
+   =========================================================== */
+
+void sm_on_tc_inc(float vel)
+{
+    s_apagar_pendente = false;
+    s_last_speed      = vel;
+    s_Tc++;
+
+    /* Acende imediatamente -- carro esta a caminho */
+    dali_set_brightness(LIGHT_MAX);
+    s_state = STATE_LIGHT_ON;
+
+    ESP_LOGI(TAG, "TC_INC: %.1fkm/h | T=%d Tc=%d", vel, s_T, s_Tc);
+}
+
+/* ===========================================================
+   EVENTO: RECEBEU SPD VIA UDP
+   -----------------------------------------------------------
+   Informativo -- TC_INC ja tratou o Tc++.
+   Guarda a velocidade para o display.
+   =========================================================== */
+
+void sm_on_spd_received(float vel, uint32_t eta_ms)
+{
+    s_last_speed = vel;
+    ESP_LOGD(TAG, "SPD recebido: %.1fkm/h ETA:%lums", vel, (unsigned long)eta_ms);
+}
+
+/* ===========================================================
+   EVENTO: VIZINHO ANTERIOR NOTIFICOU QUE CARRO PASSOU
+   -----------------------------------------------------------
+   O radar do vizinho seguinte detectou o carro, portanto
+   o carro ja saiu da zona deste poste. Decrementa T.
+   =========================================================== */
+
+void sm_on_prev_passed(void)
+{
+    if (s_T > 0) s_T--;
+    ESP_LOGD(TAG, "Carro passou anterior | T=%d Tc=%d", s_T, s_Tc);
+    verificar_apagar();
+}
+
+/* ===========================================================
+   CICLO PRINCIPAL — Chamado a 100ms pela fsm_task
+   -----------------------------------------------------------
+   Verifica se e hora de voltar a 10% (T=0, Tc=0, timeout).
+   Gere estados SAFE_MODE, MASTER e AUTONOMOUS.
+   =========================================================== */
+
+void state_machine_update(bool comm_ok, bool is_master)
+{
+    /* Verifica se ha apagamento pendente e se o timeout passou */
+    if (s_apagar_pendente && s_T <= 0 && s_Tc <= 0)
     {
-        ESP_LOGI(TAG, "Velocidade vizinho: %.1f km/h | ID=%d | pos=%d",
-                 neighbor_speed, neighbor_id, neighbor_pos);
+        uint64_t elapsed = now_ms() - s_last_detect_ms;
+        if (elapsed >= TRAFIC_TIMEOUT_MS)
+        {
+            s_apagar_pendente = false;
+            aplicar_brilho();   /* Volta a 10% */
+            ESP_LOGI(TAG, "T=0 Tc=0 timeout -> 10%%");
+
+            /* Notifica vizinhos que zona esta limpa */
+            comm_send_status(NEIGHBOR_OK);
+        }
     }
 
-    switch (current_state)
+    /* Sem comunicacao -- modo autonomo (radar local assume) */
+    if (!comm_ok && s_state != STATE_SAFE_MODE)
     {
-        case STATE_IDLE:
-            dali_set_brightness(LIGHT_MIN);
-            if (!comm_ok)
-                transition_to(STATE_SAFE_MODE, "comunicacao falhou");
-            else if (radar_event.detected)
-            {
-                transition_to(STATE_DETECTION, "veiculo detectado");
-                if (radar_event.speed > 0.0f)
-                    comm_send_vehicle(radar_event.speed);
-            }
-            break;
-
-        case STATE_DETECTION:
-            dali_set_brightness((LIGHT_MAX + LIGHT_MIN) / 2);
-            if (radar_event.detected)
-                transition_to(STATE_LIGHT_ON, "veiculo confirmado");
-            else if (time_in_state_ms() > DETECTION_TIMEOUT_MS)
-                transition_to(STATE_IDLE, "falso alarme -- timeout");
-            break;
-
-        case STATE_LIGHT_ON:
-            dali_set_brightness(LIGHT_MAX);
-            if (radar_event.detected && radar_event.speed > 0.0f)
-                comm_send_vehicle(radar_event.speed);
-            if (!radar_event.detected)
-                transition_to(STATE_TIMEOUT, "veiculo saiu");
-            break;
-
-        case STATE_TIMEOUT:
-            dali_set_brightness(LIGHT_MIN);
-            if (time_in_state_ms() >= LIGHT_ON_TIMEOUT_MS)
-                transition_to(STATE_IDLE, "timeout concluido");
-            else if (radar_event.detected)
-                transition_to(STATE_LIGHT_ON, "veiculo voltou");
-            break;
-
-        case STATE_SAFE_MODE:
-            if (radar_event.detected)
-                dali_set_brightness(LIGHT_MAX);
-            else
-                dali_set_brightness(LIGHT_SAFE_MODE);
-            if (comm_ok)
-                transition_to(STATE_IDLE, "comunicacao restabelecida");
-            break;
-
-        default:
-            ESP_LOGW(TAG, "Estado desconhecido -- reset IDLE");
-            transition_to(STATE_IDLE, "reset");
-            break;
+        /* Apenas entra em autonomo se nao houver trafego activo */
+        if (s_T == 0 && s_Tc == 0)
+        {
+            s_state = STATE_AUTONOMOUS;
+            ESP_LOGW(TAG, "Sem comunicacao -> AUTONOMO");
+        }
     }
+
+    /* Recupera de autonomo quando comunicacao volta */
+    if (comm_ok && s_state == STATE_AUTONOMOUS)
+    {
+        s_state = is_master ? STATE_MASTER : STATE_IDLE;
+        aplicar_brilho();
+        ESP_LOGI(TAG, "Comunicacao restabelecida -> %s",
+                 state_machine_get_state_name());
+
+        /* Se for pos=0, reclama lideranca */
+        if (POST_POSITION == 0)
+            comm_send_master_claim();
+    }
+
+    /* Actualiza estado MASTER */
+    if (is_master && s_state == STATE_IDLE)
+        s_state = STATE_MASTER;
+    else if (!is_master && s_state == STATE_MASTER)
+        s_state = STATE_IDLE;
 }
 
 /* ===========================================================
@@ -182,11 +274,15 @@ void state_machine_update(radar_vehicle_t radar_event, bool comm_ok)
 
 system_state_t state_machine_get_state(void)
 {
-    return current_state;
+    return s_state;
 }
 
-/* Retorna nome legivel do estado para mostrar no display */
-const char *state_machine_get_state_name(void)
+int state_machine_get_T(void)
 {
-    return state_name(current_state);
+    return s_T;
+}
+
+int state_machine_get_Tc(void)
+{
+    return s_Tc;
 }

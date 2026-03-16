@@ -1,39 +1,21 @@
 /* ============================================================
-   POST CONFIG — DECLARAÇÃO
-   ------------------------------------------------------------
-   @file      post_config.h
-   @brief     Gestão da configuração persistente do poste
-   @version   2.0
-   @date      2026-03-15
-
+   POST CONFIG — DECLARACAO
+   ============================================================
    Projecto  : Poste Inteligente
+   Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
 
-   Descrição:
+   Descricao:
    ----------
-   Carrega e persiste o ID e nome do poste na NVS (flash).
-   Valores sobrevivem a rearranques e cortes de energia.
+   Gestao da configuracao persistente do poste na NVS.
+   No primeiro arranque apos flash, popula a NVS com os
+   valores de POSTE_ID e POSTE_NAME de system_config.h.
+   Em arranques subsequentes carrega da NVS.
 
-   PRÉ-REQUISITO:
-   --------------
-   nvs_flash_init() deve ser chamado em app_main() antes de
-   post_config_init(). Este módulo não inicializa a NVS.
-
-   Utilização típica:
-   ------------------
-     // Em app_main():
-     nvs_flash_init();           // uma vez, antes de tudo
-     post_config_init();         // carrega da NVS
-     ESP_LOGI("", "%s", post_get_name());
-
-     // Para alterar e persistir:
-     post_set_id(2);
-     post_set_name("POSTE 02");
-
-   Dependências:
+   Dependencias:
    -------------
-   - nvs (já inicializada por app_main)
-   - esp_log
+   - system_config.h (POSTE_ID, POSTE_NAME)
+   - nvs_flash (inicializada em app_main antes deste modulo)
 ============================================================ */
 
 #ifndef POST_CONFIG_H
@@ -43,32 +25,21 @@
 
 #define POST_NAME_MAX_LEN   32
 
-/* Estrutura de configuração do poste */
-typedef struct
-{
-    uint8_t id;                     /* ID único do poste (0-255)  */
-    char    name[POST_NAME_MAX_LEN]; /* Nome para display e logs   */
+/* Estrutura de configuracao do poste */
+typedef struct {
+    uint8_t id;
+    char    name[POST_NAME_MAX_LEN];
 } post_config_t;
 
-/* -----------------------------------------------------------
-   post_config_init — Carrega configuração da NVS
+/* Inicializa config -- carrega NVS ou usa defaults de system_config.h */
+void        post_config_init(void);
 
-   PRÉ-REQUISITO: nvs_flash_init() já chamado em app_main().
-   Se a NVS não tiver dados, usa valores por defeito:
-     ID=0, NAME="POSTE"
-   ----------------------------------------------------------- */
-void post_config_init(void);
-
-/* Retorna ID actual do poste */
-uint8_t post_get_id(void);
-
-/* Retorna nome actual do poste */
+/* Getters */
+uint8_t     post_get_id(void);
 const char *post_get_name(void);
 
-/* Define novo ID e persiste na NVS */
-void post_set_id(uint8_t id);
-
-/* Define novo nome e persiste na NVS */
-void post_set_name(const char *name);
+/* Setters -- persistem na NVS imediatamente */
+void        post_set_id(uint8_t id);
+void        post_set_name(const char *name);
 
 #endif /* POST_CONFIG_H */

@@ -1,51 +1,56 @@
 /* ============================================================
-   UDP MANAGER — DECLARAÇÃO
-   ------------------------------------------------------------
-   @file      udp_manager.h
-   @brief     Comunicação UDP entre postes inteligentes
-   @version   4.0
-   @date      2026-03-15
-
+   UDP MANAGER — DECLARACAO
+   ============================================================
    Projecto  : Poste Inteligente
+   Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
 
-   Alterações (v3.0 → v4.0):
-   --------------------------
-   1. Adicionado neighbor_status_t (OK / OFFLINE / SAFE_MODE)
-   2. neighbor_t agora inclui: last_speed, last_seen, status
-   3. Adicionada udp_manager_process() — processa DISCOVER, ACK,
-      SPD e STATUS numa única chamada (para a udp_rx_task)
-   4. Adicionada udp_manager_send_ack() — envia confirmação
-   5. Adicionada udp_manager_send_status() — propaga estado
-   6. Adicionada udp_manager_load_neighbors_nvs() — carrega
-      vizinhos persistidos na NVS ao arrancar
-   7. Adicionada udp_manager_save_neighbors_nvs() — persiste
-      tabela de vizinhos na NVS após cada alteração
+   Descricao:
+   ----------
+   Camada de transporte UDP entre postes inteligentes.
+   Implementa o protocolo completo de descoberta, propagacao
+   de velocidade com ETA, gestao de contadores T/Tc,
+   lideranca de linha (MASTER_CLAIM) e estado (STATUS).
 
-   Protocolo de mensagens UDP (texto simples):
-   -------------------------------------------
-   DISCOVER:<id>:<name>:<pos>
-     → Broadcast de anúncio. Receptor regista o emissor
-       e responde com DISCOVER_ACK.
+   Protocolo de mensagens (texto simples, separado por ':'):
+   ----------------------------------------------------------
+   DISCOVER:<id>:<nome>:<pos>
+     Broadcast de anuncio periodico.
 
-   DISCOVER_ACK:<id>:<name>:<pos>:<ip>
-     → Resposta directa ao DISCOVER. Confirma registo.
+   DISCOVER_ACK:<id>:<nome>:<pos>:<ip>
+     Resposta unicast ao DISCOVER.
 
-   SPD:<id>:<name>:<pos>:<velocidade>
-     → Dados de velocidade de veículo detectado.
+   SPD:<id>:<nome>:<pos>:<vel>:<eta_ms>:<dist_m>
+     Velocidade + ETA para o proximo poste.
+     Receptor incrementa Tc e agenda acendimento no ETA.
+
+   TC_INC:<id>:<pos>:<vel>
+     Incrementa Tc no vizinho -- carro a caminho.
+     Enviado imediatamente apos deteccao pelo radar.
 
    ACK:<id>:<msg_type>
-     → Confirmação de recepção. msg_type = "SPD" ou "STATUS".
+     Confirmacao de recepcao.
 
    STATUS:<id>:<pos>:<estado>
-     → Propagação de estado. estado = "OK", "OFFLINE", "SAFE".
+     Estado do poste: OK / OFFLINE / SAFE / MASTER
 
-   Dependências:
+   MASTER_CLAIM:<id>:<pos>
+     Reclama lideranca da linha. pos=0 tem prioridade maxima.
+     Propagado em cadeia de poste em poste.
+
+   Contadores T e Tc por poste (implementados em state_machine):
+   -------------------------------------------------------------
+   T[i]  = carros presentes na zona do poste i (radar confirmou)
+   Tc[i] = carros a caminho do poste i (UDP informou, ainda nao chegaram)
+   Luz 100% quando T>0 OU Tc>0
+   Luz 10%  apenas quando T=0 E Tc=0 (apos TRAFIC_TIMEOUT_MS)
+
+   Dependencias:
    -------------
-   - system_config.h (UDP_PORT, MAX_NEIGHBORS, MAX_IP_LEN,
-                      NEIGHBOR_TIMEOUT_MS, ACK_TIMEOUT_MS)
-   - wifi_manager.h  (wifi_get_ip)
-   - nvs, lwip
+   - system_config.h
+   - post_config.h
+   - wifi_manager.h
+   - lwip/sockets, nvs, esp_timer
 ============================================================ */
 
 #ifndef UDP_MANAGER_H
@@ -59,74 +64,100 @@
 /* ===========================================================
    Estado do vizinho
    =========================================================== */
-typedef enum
-{
-    NEIGHBOR_OK        = 0, /* Activo e a comunicar normalmente */
-    NEIGHBOR_OFFLINE,       /* Sem resposta após NEIGHBOR_TIMEOUT_MS */
-    NEIGHBOR_SAFE_MODE      /* Online mas em modo seguro autónomo   */
+typedef enum {
+    NEIGHBOR_OK        = 0, /* Activo e a comunicar normalmente   */
+    NEIGHBOR_OFFLINE,       /* Sem resposta apos NEIGHBOR_TIMEOUT */
+    NEIGHBOR_SAFE_MODE,     /* Online mas radar falhou -- 50%     */
+    NEIGHBOR_MASTER         /* Assumiu lideranca da linha         */
 } neighbor_status_t;
 
 /* ===========================================================
    Estrutura de vizinho
    =========================================================== */
-typedef struct
-{
-    char               ip[MAX_IP_LEN];  /* IP do vizinho               */
-    int                id;              /* ID do poste vizinho         */
-    int                pos;             /* Posição na cadeia           */
-    char               name[32];        /* Nome do poste               */
-    uint64_t           last_seen;       /* Timestamp último contacto   */
-    float              last_speed;      /* Última velocidade recebida  */
-    neighbor_status_t  status;          /* Estado actual do vizinho    */
-    bool               active;          /* Registo válido na tabela    */
+typedef struct {
+    char              ip[MAX_IP_LEN]; /* IP do vizinho                  */
+    int               id;             /* ID do poste vizinho            */
+    int               pos;            /* Posicao na cadeia              */
+    char              name[32];       /* Nome do poste                  */
+    uint64_t          last_seen;      /* Timestamp ultimo contacto (ms) */
+    float             last_speed;     /* Ultima velocidade recebida     */
+    uint32_t          last_eta_ms;    /* Ultimo ETA recebido (ms)       */
+    neighbor_status_t status;         /* Estado actual do vizinho       */
+    bool              active;         /* Registo valido na tabela       */
 } neighbor_t;
 
 /* ===========================================================
-   API — Inicialização
+   Estrutura de mensagem SPD recebida
+   =========================================================== */
+typedef struct {
+    int      id;            /* ID do poste emissor             */
+    int      pos;           /* Posicao do poste emissor        */
+    float    speed;         /* Velocidade do veiculo (km/h)    */
+    uint32_t eta_ms;        /* ETA para o proximo poste (ms)   */
+    float    dist_m;        /* Distancia entre postes (m)      */
+} spd_msg_t;
+
+/* ===========================================================
+   API — Inicializacao
    =========================================================== */
 
-/* Cria socket UDP, faz bind na UDP_PORT.
-   Deve ser chamada após wifi_start_auto(). */
+/* Cria socket UDP, faz bind na UDP_PORT, carrega NVS */
 bool udp_manager_init(void);
 
-/* Carrega tabela de vizinhos persistida na NVS.
-   Chamada em udp_manager_init() automaticamente. */
+/* Carrega tabela de vizinhos da NVS */
 void udp_manager_load_neighbors_nvs(void);
 
-/* Persiste tabela de vizinhos na NVS. */
+/* Persiste tabela de vizinhos na NVS */
 void udp_manager_save_neighbors_nvs(void);
 
 /* ===========================================================
    API — Envio
    =========================================================== */
 
-/* Envia mensagem para um IP específico */
-bool udp_manager_send_to(const char *buffer, size_t len, const char *ip);
+/* Envia mensagem para IP especifico */
+bool udp_manager_send_to(const char *buf, size_t len, const char *ip);
 
-/* Envia DISCOVER em broadcast — anuncia este poste à rede */
-void udp_manager_discover_neighbors(void);
+/* Envia DISCOVER broadcast */
+void udp_manager_discover(void);
 
-/* Envia ACK de confirmação para um IP */
+/* Envia SPD com ETA calculado para vizinho directo */
+bool udp_manager_send_spd(const char *dest_ip,
+                           float       speed,
+                           uint32_t    eta_ms,
+                           float       dist_m);
+
+/* Envia TC_INC -- incrementa Tc no vizinho imediatamente */
+bool udp_manager_send_tc_inc(const char *dest_ip, float speed);
+
+/* Envia ACK de confirmacao */
 bool udp_manager_send_ack(const char *dest_ip, const char *msg_type);
 
-/* Envia STATUS para vizinho directo */
-bool udp_manager_send_status(const char *dest_ip,
-                              neighbor_status_t status);
+/* Envia STATUS para vizinho */
+bool udp_manager_send_status(const char *dest_ip, neighbor_status_t status);
 
-/* Constrói mensagem SPD no buffer */
-void udp_build_spd(char *buffer, size_t max_len, float speed);
+/* Envia MASTER_CLAIM para vizinho directo */
+bool udp_manager_send_master_claim(const char *dest_ip);
 
 /* ===========================================================
-   API — Recepção e processamento
+   API — Recepcao e processamento
    =========================================================== */
 
-/* Processa uma mensagem recebida (não bloqueante — MSG_DONTWAIT).
-   Trata: DISCOVER, DISCOVER_ACK, SPD, ACK, STATUS.
-   Se for SPD, preenche speed_out e retorna true.
-   Para todas as outras mensagens processa internamente. */
-bool udp_manager_process(float  *speed_out,
-                          int    *id_out,
-                          int    *pos_out);
+/* Processa UMA mensagem recebida (nao bloqueante).
+   Retorna tipo da mensagem processada ou UDP_MSG_NONE. */
+typedef enum {
+    UDP_MSG_NONE = 0,
+    UDP_MSG_SPD,            /* Velocidade + ETA recebidos     */
+    UDP_MSG_TC_INC,         /* Incrementar Tc (carro a caminho) */
+    UDP_MSG_STATUS,         /* Estado de vizinho alterado     */
+    UDP_MSG_MASTER_CLAIM,   /* Vizinho reclama lideranca      */
+    UDP_MSG_DISCOVER,       /* Novo vizinho anunciou-se       */
+    UDP_MSG_ACK             /* Confirmacao recebida           */
+} udp_msg_type_t;
+
+udp_msg_type_t udp_manager_process(spd_msg_t        *spd_out,
+                                    neighbor_status_t *status_out,
+                                    int               *src_id_out,
+                                    int               *src_pos_out);
 
 /* ===========================================================
    API — Tabela de vizinhos
@@ -135,14 +166,16 @@ bool udp_manager_process(float  *speed_out,
 /* Copia vizinhos activos para list[]. Retorna contagem. */
 size_t udp_manager_get_neighbors(neighbor_t *list, size_t max);
 
-/* Retorna true se existir pelo menos um vizinho activo */
+/* Retorna true se existir pelo menos um vizinho online */
 bool udp_manager_has_active_neighbors(void);
 
-/* Marca vizinhos sem contacto há mais de NEIGHBOR_TIMEOUT_MS
-   como NEIGHBOR_OFFLINE. Chamar periodicamente. */
+/* Marca vizinhos sem contacto como OFFLINE */
 void udp_manager_check_timeouts(void);
 
-/* Retorna contagem total de vizinhos registados (activos + offline) */
+/* Retorna contagem de vizinhos registados */
 size_t udp_manager_get_neighbor_count(void);
+
+/* Retorna vizinho com posicao especifica (ou NULL) */
+neighbor_t *udp_manager_get_neighbor_by_pos(int pos);
 
 #endif /* UDP_MANAGER_H */

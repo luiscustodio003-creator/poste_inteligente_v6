@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "poste_inteligente_v6",
-    "project_version":    "1",
+    "project_version":    "9758d5d-dirty",
     "project_path":       "D:/Dev/C/poste_inteligente_v6",
     "idf_path":           "C:/esp/v5.4.3/esp-idf",
     "build_dir":          "D:/Dev/C/poste_inteligente_v6/build",
@@ -220,8 +220,8 @@
             "managed_reqs": [],
             "managed_priv_reqs": [],
             "file": "D:/Dev/C/poste_inteligente_v6/build/esp-idf/display_manager/libdisplay_manager.a",
-            "sources": [ "D:/Dev/C/poste_inteligente_v6/components/display_manager/display_manager.c", "D:/Dev/C/poste_inteligente_v6/components/display_manager/assets/wifi_off.c", "D:/Dev/C/poste_inteligente_v6/components/display_manager/assets/wifi_on.c" ],
-            "include_dirs": [ ".", "assets" ]
+            "sources": [ "D:/Dev/C/poste_inteligente_v6/components/display_manager/display_manager.c" ],
+            "include_dirs": [ "." ]
         },
         "driver": {
             "alias": "idf::driver",
@@ -3070,7 +3070,7 @@
             "priv_reqs": [],
             "managed_reqs": [],
             "managed_priv_reqs": [],
-            "include_dirs": [ ".", "assets" ]
+            "include_dirs": [ "." ]
         },
         "lvgl": {
             "alias": "idf::lvgl",

@@ -1,36 +1,48 @@
 /* ============================================================
-   DALi MANAGER MODULE
-   ------------------------------------------------------------
-   @file dali_manager.h
-   @brief Controlo da luminária via PWM (preparado para DALi)
-
-   Projeto: Poste Inteligente
+   DALI MANAGER — DECLARACAO
+   ============================================================
+   Projecto  : Poste Inteligente
+   Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
-   ============================================================ */
+
+   Descricao:
+   ----------
+   Controlo da luminaria via PWM LEDC (simulacao DALI).
+   Escala 0-100% para duty 0-255 (8 bits, 5000 Hz).
+   Thread-safe via spinlock portMUX.
+
+   NOTA: LEDC_HIGH_SPEED_MODE apenas no ESP32 original (LX6).
+   Para ESP32-S2/S3/C3 alterar para LEDC_LOW_SPEED_MODE.
+
+   Ref: https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/ledc.html
+
+   Dependencias:
+   -------------
+   - hw_config.h (LED_PWM_PIN)
+   - system_config.h (LIGHT_MIN, LIGHT_MAX, LIGHT_SAFE_MODE)
+============================================================ */
 
 #ifndef DALI_MANAGER_H
 #define DALI_MANAGER_H
 
 #include <stdint.h>
-#include <stdbool.h>
 
-/** Inicializa timer LEDC e canal PWM no pino LED_PWM_PIN. */
+/* Inicializa timer LEDC e canal PWM */
 void    dali_init(void);
 
-/** Define brilho (0-100%). Valores fora do intervalo são truncados
- *  para LIGHT_MIN / LIGHT_MAX definidos em system_config.h. */
+/* Define brilho 0-100% -- clamped por LIGHT_MIN/MAX */
 void    dali_set_brightness(uint8_t brightness);
 
-/** Liga luminária a LIGHT_MAX. */
+/* Liga a LIGHT_MAX */
 void    dali_turn_on(void);
 
-/** Desliga luminária para LIGHT_MIN. */
+/* Desliga para LIGHT_MIN */
 void    dali_turn_off(void);
 
-/** Ativa modo de segurança (LIGHT_SAFE_MODE). */
+/* Modo seguro -- LIGHT_SAFE_MODE */
 void    dali_safe_mode(void);
 
-/** Retorna brilho atual em % (thread-safe). */
+/* Retorna brilho actual (thread-safe via spinlock) */
 uint8_t dali_get_brightness(void);
 
 #endif /* DALI_MANAGER_H */

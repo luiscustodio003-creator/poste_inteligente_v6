@@ -1,194 +1,231 @@
 /* ============================================================
-   COMM MANAGER — IMPLEMENTAÇÃO
-   ------------------------------------------------------------
-   @file      comm_manager.c
-   @brief     Gestão da comunicação entre postes inteligentes
-   @version   3.0
-   @date      2026-03-15
-
+   COMM MANAGER — IMPLEMENTACAO
+   ============================================================
    Projecto  : Poste Inteligente
+   Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
 
-   Alterações (v2.0 → v3.0):
-   --------------------------
-   1. CORRECÇÃO CRÍTICA: removido wifi_start_auto() de comm_init().
-      O Wi-Fi era iniciado duas vezes (aqui e em app_main()),
-      causando comportamento indefinido no driver Wi-Fi do ESP32.
-      O Wi-Fi deve ser iniciado APENAS em app_main().
-   2. comm_init() agora só inicializa UDP — assume que o Wi-Fi
-      já está activo quando é chamado.
-   3. comm_receive_vehicle() actualizado para usar
-      udp_manager_process() em vez de udp_manager_receive()
-      (que foi removido na v4.0 do udp_manager).
-   4. Adicionado comm_send_status() — propaga estado deste
-      poste para todos os vizinhos directos.
-   5. Adicionado comm_discover() — envia DISCOVER broadcast.
-
-   Descrição:
+   Descricao:
    ----------
-   Camada de abstração sobre udp_manager.
-   Coordena: envio de SPD, recepção de SPD, propagação de
-   estado (STATUS) e descoberta de vizinhos (DISCOVER).
-
-   Dependências:
-   -------------
-   - comm_manager.h
-   - wifi_manager.h
-   - udp_manager.h
-   - system_config.h
+   Abstraccao de alto nivel sobre o udp_manager.
+   Calcula ETA automaticamente e gere a logica de MASTER.
 ============================================================ */
 
 #include "comm_manager.h"
 #include "wifi_manager.h"
 #include "udp_manager.h"
 #include "system_config.h"
-
 #include "esp_log.h"
 #include <string.h>
-#include <stdio.h>
 
 static const char *TAG = "COMM_MGR";
-
-static bool s_comm_ok = false;
+static bool s_ok = false;
 
 /* ===========================================================
-   INICIALIZAÇÃO
-   -----------------------------------------------------------
-   NOTA: O Wi-Fi deve estar activo antes de chamar comm_init().
-   wifi_start_auto() deve ser chamado em app_main() antes desta
-   função. Não chamar wifi_start_auto() aqui.
+   INICIALIZACAO
    =========================================================== */
 
 bool comm_init(void)
 {
-    ESP_LOGI(TAG, "Inicializar sistema de comunicação UDP");
+    ESP_LOGI(TAG, "Inicializar comunicacao UDP");
 
-    /* Verifica que o Wi-Fi já está activo */
+    /* Wi-Fi deve estar activo antes de criar o socket */
     if (!wifi_is_connected() && !wifi_is_ap_active())
     {
-        ESP_LOGW(TAG, "Wi-Fi não activo — aguardar antes de comm_init()");
+        ESP_LOGW(TAG, "Wi-Fi nao activo -- aguardar");
         return false;
     }
 
-    /* Inicializa socket UDP */
     if (!udp_manager_init())
     {
         ESP_LOGE(TAG, "Falha iniciar UDP");
         return false;
     }
 
-    s_comm_ok = true;
-    ESP_LOGI(TAG, "Comunicação inicializada");
+    s_ok = true;
+    ESP_LOGI(TAG, "Comunicacao pronta");
     return true;
 }
 
 /* ===========================================================
-   ESTADO DA COMUNICAÇÃO
-   =========================================================== */
-
-bool comm_status_ok(void)
-{
-    if (!s_comm_ok) return false;
-    return (wifi_is_connected() || wifi_is_ap_active());
-}
-
-/* ===========================================================
-   DESCOBERTA DE VIZINHOS
+   DISCOVER
    =========================================================== */
 
 void comm_discover(void)
 {
-    if (!s_comm_ok) return;
-    udp_manager_discover_neighbors();
+    if (!s_ok) return;
+    udp_manager_discover();
 }
 
 /* ===========================================================
-   ENVIAR VELOCIDADE
+   CALCULO DE ETA
    -----------------------------------------------------------
-   Envia SPD para todos os vizinhos activos conhecidos.
-   Retorna true se pelo menos um envio foi bem sucedido.
-   O ACK é processado assincronamente na udp_rx_task.
+   ETA = tempo que o carro demora a chegar a zona do radar
+   do proximo poste, a partir do momento de deteccao.
+   Formula: (POSTE_DIST_M - RADAR_DETECT_M) / velocidade_ms
    =========================================================== */
 
-bool comm_send_vehicle(float speed)
+static uint32_t calc_eta_ms(float speed_kmh)
 {
-    if (!s_comm_ok) return false;
+    if (speed_kmh <= 0.0f) return 5000; /* Valor por defeito seguro */
+    float speed_ms = speed_kmh / 3.6f;
+    float dist     = (float)POSTE_DIST_M - (float)RADAR_DETECT_M;
+    return (uint32_t)((dist / speed_ms) * 1000.0f);
+}
 
-    neighbor_t neighbors[MAX_NEIGHBORS];
-    size_t n = udp_manager_get_neighbors(neighbors, MAX_NEIGHBORS);
+/* ===========================================================
+   ENVIO SPD COM ETA
+   -----------------------------------------------------------
+   Enviado para o vizinho direito quando o radar deteta carro.
+   O vizinho usa o ETA para acender no momento exacto.
+   =========================================================== */
 
-    if (n == 0)
+bool comm_send_spd(float speed)
+{
+    if (!s_ok) return false;
+
+    neighbor_t *next = comm_get_neighbor_right();
+    if (!next || next->status == NEIGHBOR_OFFLINE)
     {
-        ESP_LOGW(TAG, "Sem vizinhos — SPD não enviado");
+        ESP_LOGD(TAG, "Sem vizinho direito para SPD");
         return false;
     }
 
-    char packet[128];
-    udp_build_spd(packet, sizeof(packet), speed);
-
-    bool sent = false;
-
-    for (size_t i = 0; i < n; i++)
-    {
-        /* Só envia para vizinhos que não estão offline */
-        if (neighbors[i].status == NEIGHBOR_OFFLINE) continue;
-
-        if (udp_manager_send_to(packet, strlen(packet), neighbors[i].ip))
-        {
-            ESP_LOGI(TAG, "SPD → %s (ID=%d): %.1f km/h",
-                     neighbors[i].ip, neighbors[i].id, speed);
-            sent = true;
-        }
-    }
-
-    return sent;
+    uint32_t eta = calc_eta_ms(speed);
+    return udp_manager_send_spd(next->ip, speed, eta, POSTE_DIST_M);
 }
 
 /* ===========================================================
-   RECEBER VELOCIDADE
+   TC_INC — Carro a caminho (enviado imediatamente)
    -----------------------------------------------------------
-   Processa uma mensagem UDP recebida.
-   Se for SPD, preenche os parâmetros e retorna true.
-   Para DISCOVER/ACK/STATUS processa internamente e retorna false.
+   Enviado logo apos deteccao pelo radar, antes do SPD.
+   O vizinho incrementa Tc e acende a 100%.
    =========================================================== */
 
-bool comm_receive_vehicle(float *speed, int *post_id, int *post_pos)
+bool comm_send_tc_inc(float speed)
 {
-    if (!s_comm_ok) return false;
+    if (!s_ok) return false;
 
-    /* udp_manager_process() trata todos os tipos de mensagem.
-       Só retorna true quando recebe um pacote SPD válido.    */
-    return udp_manager_process(speed, post_id, post_pos);
+    neighbor_t *next = comm_get_neighbor_right();
+    if (!next || next->status == NEIGHBOR_OFFLINE)
+        return false;
+
+    bool ok = udp_manager_send_tc_inc(next->ip, speed);
+    if (ok) ESP_LOGI(TAG, "TC_INC->%s %.1fkm/h", next->ip, speed);
+    return ok;
 }
 
 /* ===========================================================
-   PROPAGAR ESTADO
+   NOTIFICA ANTERIOR — Carro ja passou
    -----------------------------------------------------------
-   Envia STATUS para todos os vizinhos directos.
-   Usado pela state_machine quando muda de estado.
+   Enviado quando o radar deste poste deteta um carro.
+   O poste anterior decrementa o seu T.
+   Usa STATUS com campo especial para indicar T--.
+   =========================================================== */
+
+bool comm_notify_prev_passed(float speed)
+{
+    if (!s_ok) return false;
+
+    neighbor_t *prev = comm_get_neighbor_left();
+    if (!prev || prev->status == NEIGHBOR_OFFLINE)
+        return false;
+
+    /* Envia TC_INC com velocidade negativa como sinal de T-- */
+    bool ok = udp_manager_send_tc_inc(prev->ip, -speed);
+    if (ok) ESP_LOGD(TAG, "Notificou anterior ID=%d carro passou", prev->id);
+    return ok;
+}
+
+/* ===========================================================
+   MASTER_CLAIM — Reclama lideranca da linha
+   -----------------------------------------------------------
+   Enviado pelo poste com pos=0 ao voltar online.
+   O vizinho direito cede lideranca e propaga em cadeia.
+   =========================================================== */
+
+void comm_send_master_claim(void)
+{
+    if (!s_ok) return;
+
+    neighbor_t *next = comm_get_neighbor_right();
+    if (!next) return;
+
+    udp_manager_send_master_claim(next->ip);
+    ESP_LOGI(TAG, "MASTER_CLAIM propagado para ID=%d", next->id);
+}
+
+/* ===========================================================
+   STATUS — Propaga estado para todos os vizinhos
    =========================================================== */
 
 void comm_send_status(neighbor_status_t status)
 {
-    if (!s_comm_ok) return;
+    if (!s_ok) return;
 
-    neighbor_t neighbors[MAX_NEIGHBORS];
-    size_t n = udp_manager_get_neighbors(neighbors, MAX_NEIGHBORS);
+    neighbor_t list[MAX_NEIGHBORS];
+    size_t n = udp_manager_get_neighbors(list, MAX_NEIGHBORS);
 
     for (size_t i = 0; i < n; i++)
     {
-        if (!neighbors[i].active) continue;
-
-        udp_manager_send_status(neighbors[i].ip, status);
-        ESP_LOGD(TAG, "STATUS → ID=%d", neighbors[i].id);
+        if (!list[i].active) continue;
+        udp_manager_send_status(list[i].ip, status);
     }
 }
 
 /* ===========================================================
-   TABELA DE VIZINHOS PARA O DISPLAY
+   VIZINHOS POR POSICAO
    =========================================================== */
+
+/* Vizinho esquerdo -- pos = POST_POSITION - 1 */
+neighbor_t *comm_get_neighbor_left(void)
+{
+    if (POST_POSITION == 0) return NULL; /* Primeiro poste nao tem esquerdo */
+    return udp_manager_get_neighbor_by_pos(POST_POSITION - 1);
+}
+
+/* Vizinho direito -- pos = POST_POSITION + 1 */
+neighbor_t *comm_get_neighbor_right(void)
+{
+    return udp_manager_get_neighbor_by_pos(POST_POSITION + 1);
+}
 
 size_t comm_get_neighbors(neighbor_t *list, size_t max)
 {
     return udp_manager_get_neighbors(list, max);
+}
+
+/* ===========================================================
+   ESTADO DA LINHA
+   =========================================================== */
+
+/* Poste e MASTER se:
+   - nao tem vizinho esquerdo (pos=0), OU
+   - vizinho esquerdo esta OFFLINE */
+bool comm_is_master(void)
+{
+    if (POST_POSITION == 0) return true;
+    neighbor_t *left = comm_get_neighbor_left();
+    if (!left) return true;
+    return (left->status == NEIGHBOR_OFFLINE);
+}
+
+bool comm_status_ok(void)
+{
+    if (!s_ok) return false;
+    return (wifi_is_connected() || wifi_is_ap_active());
+}
+
+bool comm_left_online(void)
+{
+    neighbor_t *left = comm_get_neighbor_left();
+    if (!left) return false;
+    return (left->status != NEIGHBOR_OFFLINE);
+}
+
+bool comm_right_online(void)
+{
+    neighbor_t *right = comm_get_neighbor_right();
+    if (!right) return false;
+    return (right->status != NEIGHBOR_OFFLINE);
 }

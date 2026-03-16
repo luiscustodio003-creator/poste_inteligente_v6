@@ -1,6 +1,6 @@
 idf_component_register(
-    SRCS "display_manager.c" "assets/wifi_off.c" "assets/wifi_on.c"
-    INCLUDE_DIRS "." "assets"
+    SRCS "display_manager.c"
+    INCLUDE_DIRS "."
     REQUIRES
         display_driver
         lvgl
@@ -8,4 +8,5 @@ idf_component_register(
         freertos
         esp_timer
         log
+        config
 )

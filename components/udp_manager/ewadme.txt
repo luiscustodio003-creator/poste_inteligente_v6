@@ -1,0 +1,91 @@
+================================================================================
+MODULO: udp_manager
+================================================================================
+Projecto  : Poste Inteligente
+Estudantes: Luis Custodio | Tiago Moreno
+Plataforma: ESP32 (ESP-IDF)
+
+DESCRICAO
+---------
+Camada de transporte UDP para comunicacao entre postes inteligentes.
+Implementa o protocolo completo de descoberta, propagacao de velocidade
+com calculo de ETA, gestao de contadores de trafego (T/Tc), lideranca
+de linha (MASTER_CLAIM) e propagacao de estado (STATUS).
+
+PROTOCOLO DE MENSAGENS
+----------------------
+Todas as mensagens sao texto simples com campos separados por ':'.
+
+  DISCOVER:<id>:<nome>:<pos>
+    Broadcast periodico de anuncio. O receptor regista o emissor
+    na sua tabela de vizinhos e responde com DISCOVER_ACK.
+
+  DISCOVER_ACK:<id>:<nome>:<pos>:<ip>
+    Resposta unicast ao DISCOVER. Confirma registo mutuo.
+
+  SPD:<id>:<nome>:<pos>:<vel>:<eta_ms>:<dist_m>
+    Velocidade detectada pelo radar + ETA calculado para o proximo poste.
+    O receptor incrementa Tc e agenda acendimento antecipado.
+    ETA calculado como: (POSTE_DIST_M + RADAR_DETECT_M) / velocidade_ms
+
+  TC_INC:<id>:<pos>:<vel>
+    Incrementa Tc (carros a caminho) no vizinho imediatamente.
+    Enviado quando o radar deteta carro antes do SPD processar.
+
+  ACK:<id>:<msg_type>
+    Confirmacao de recepcao de SPD, STATUS ou MASTER_CLAIM.
+
+  STATUS:<id>:<pos>:<estado>
+    Propagacao de estado: OK / OFFLINE / SAFE / MASTER
+
+  MASTER_CLAIM:<id>:<pos>
+    Reclama lideranca da linha. Poste com pos=0 tem prioridade maxima.
+    Propagado em cadeia de poste em poste com delay de 100ms.
+
+LOGICA DE CONTADORES T e Tc
+----------------------------
+  T[i]  = carros presentes na zona do poste i (radar confirmou chegada)
+  Tc[i] = carros a caminho do poste i (UDP informou, ainda nao chegaram)
+
+  Quando radar deteta carro em poste i:
+    1. Tc[i]-- (era "a caminho", agora "chegou")
+    2. T[i]++
+    3. T[i-1]-- (carro ja passou o poste anterior)
+    4. Tc[i+1]++ via SPD/TC_INC com delay = ETA
+
+  Luz volta a 10% (LIGHT_MIN) apenas quando T[i]=0 E Tc[i]=0,
+  apos TRAFIC_TIMEOUT_MS de espera.
+
+FUNCIONALIDADES
+---------------
+  udp_manager_init()              : cria socket, bind, carrega NVS
+  udp_manager_discover()          : broadcast DISCOVER
+  udp_manager_send_spd()          : envia SPD com ETA
+  udp_manager_send_tc_inc()       : envia TC_INC (carro a caminho)
+  udp_manager_send_ack()          : envia ACK
+  udp_manager_send_status()       : envia STATUS
+  udp_manager_send_master_claim() : envia MASTER_CLAIM
+  udp_manager_process()           : processa UMA mensagem (nao bloqueante)
+  udp_manager_get_neighbors()     : lista vizinhos activos
+  udp_manager_get_neighbor_by_pos(): vizinho por posicao na cadeia
+  udp_manager_check_timeouts()    : marca vizinhos offline
+  udp_manager_load/save_nvs()     : persistencia da tabela
+
+DEPENDENCIAS
+------------
+  - wifi_manager  : wifi_get_ip() para ignorar pacotes proprios
+  - config        : post_get_id(), post_get_name(), POST_POSITION
+  - lwip          : API de sockets UDP
+                    https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-guides/lwip.html
+  - nvs_flash     : persistencia da tabela de vizinhos
+                    https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/storage/nvs_flash.html
+  - esp_timer     : timestamps para timeouts
+                    https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/system/esp_timer.html
+
+NOTAS
+-----
+  - O socket e criado em modo nao bloqueante (O_NONBLOCK).
+  - udp_manager_process() deve ser chamada ciclicamente na udp_rx_task.
+  - A tabela de vizinhos e persistida na NVS apos cada alteracao.
+  - Vizinhos carregados da NVS arrancam como OFFLINE ate confirmarem.
+================================================================================

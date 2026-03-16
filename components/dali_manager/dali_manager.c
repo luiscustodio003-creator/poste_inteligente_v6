@@ -1,12 +1,18 @@
 /* ============================================================
-   DALi MANAGER IMPLEMENTATION
-   ------------------------------------------------------------
-   @file dali_manager.c
-   @brief Controlo de luminária via PWM (simulação DALi)
-
-   Projeto: Poste Inteligente
+   DALI MANAGER — IMPLEMENTACAO
+   ============================================================
+   Projecto  : Poste Inteligente
+   Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
-   ============================================================ */
+
+   Descricao:
+   ----------
+   Controlo PWM da luminaria via modulo LEDC do ESP32.
+   Preparado para protocolo DALI real -- actualmente usa
+   PWM analogico de 8 bits a 5000 Hz.
+
+   Ref: https://docs.espressif.com/projects/esp-idf/en/stable/esp32/api-reference/peripherals/ledc.html
+============================================================ */
 
 #include "dali_manager.h"
 #include "hw_config.h"
@@ -18,30 +24,35 @@
 
 static const char *TAG = "DALI_MGR";
 
+/* Configuracao do canal LEDC */
 #define LEDC_MODE       LEDC_HIGH_SPEED_MODE
 #define LEDC_CHANNEL    LEDC_CHANNEL_0
 #define LEDC_TIMER      LEDC_TIMER_0
 #define LEDC_DUTY_RES   LEDC_TIMER_8_BIT
 #define LEDC_FREQ_HZ    5000
 
-static uint8_t        g_current_brightness = 0;
-static portMUX_TYPE   s_spinlock = portMUX_INITIALIZER_UNLOCKED;
+/* Estado interno protegido por spinlock */
+static uint8_t      s_brightness = 0;
+static portMUX_TYPE s_mux        = portMUX_INITIALIZER_UNLOCKED;
 
-/* ============================================================
-   Inicialização
-   ============================================================ */
+/* ===========================================================
+   INICIALIZACAO
+   =========================================================== */
+
 void dali_init(void)
 {
-    ledc_timer_config_t timer_conf = {
+    /* Configura timer LEDC */
+    ledc_timer_config_t timer = {
         .speed_mode      = LEDC_MODE,
         .timer_num       = LEDC_TIMER,
         .duty_resolution = LEDC_DUTY_RES,
         .freq_hz         = LEDC_FREQ_HZ,
         .clk_cfg         = LEDC_AUTO_CLK
     };
-    ESP_ERROR_CHECK(ledc_timer_config(&timer_conf));
+    ESP_ERROR_CHECK(ledc_timer_config(&timer));
 
-    ledc_channel_config_t channel_conf = {
+    /* Configura canal no pino da luminaria */
+    ledc_channel_config_t ch = {
         .speed_mode = LEDC_MODE,
         .channel    = LEDC_CHANNEL,
         .timer_sel  = LEDC_TIMER,
@@ -50,41 +61,63 @@ void dali_init(void)
         .duty       = 0,
         .hpoint     = 0
     };
-    ESP_ERROR_CHECK(ledc_channel_config(&channel_conf));
+    ESP_ERROR_CHECK(ledc_channel_config(&ch));
 
-    ESP_LOGI(TAG, "DALi Manager inicializado no pino %d", LED_PWM_PIN);
+    /* Arranca com brilho minimo */
+    dali_set_brightness(LIGHT_MIN);
+
+    ESP_LOGI(TAG, "DALI inicializado | pino=%d | %d%%",
+             LED_PWM_PIN, LIGHT_MIN);
 }
 
-/* ============================================================
-   Controlo de brilho
-   ============================================================ */
+/* ===========================================================
+   CONTROLO DE BRILHO
+   =========================================================== */
+
 void dali_set_brightness(uint8_t brightness)
 {
+    /* Limita entre LIGHT_MIN e LIGHT_MAX */
     if (brightness < LIGHT_MIN) brightness = LIGHT_MIN;
     if (brightness > LIGHT_MAX) brightness = LIGHT_MAX;
 
-    /* Escala 0-100% para 0-255 (8 bits) */
+    /* Escala 0-100% para duty 0-255 (8 bits) */
     uint32_t duty = (uint32_t)((brightness * 255U) / 100U);
 
     ESP_ERROR_CHECK(ledc_set_duty(LEDC_MODE, LEDC_CHANNEL, duty));
     ESP_ERROR_CHECK(ledc_update_duty(LEDC_MODE, LEDC_CHANNEL));
 
-    portENTER_CRITICAL(&s_spinlock);
-    g_current_brightness = brightness;
-    portEXIT_CRITICAL(&s_spinlock);
+    /* Guarda estado de forma thread-safe */
+    portENTER_CRITICAL(&s_mux);
+    s_brightness = brightness;
+    portEXIT_CRITICAL(&s_mux);
 
     ESP_LOGD(TAG, "Brilho: %d%% (duty=%lu)", brightness, duty);
 }
 
-void dali_turn_on(void)    { dali_set_brightness(LIGHT_MAX); }
-void dali_turn_off(void)   { dali_set_brightness(LIGHT_MIN); }
-void dali_safe_mode(void)  { dali_set_brightness(LIGHT_SAFE_MODE); }
+/* Liga a potencia maxima */
+void dali_turn_on(void)
+{
+    dali_set_brightness(LIGHT_MAX);
+}
 
+/* Desliga para potencia minima */
+void dali_turn_off(void)
+{
+    dali_set_brightness(LIGHT_MIN);
+}
+
+/* Modo seguro -- brilho intermedio fixo */
+void dali_safe_mode(void)
+{
+    dali_set_brightness(LIGHT_SAFE_MODE);
+}
+
+/* Retorna brilho actual de forma thread-safe */
 uint8_t dali_get_brightness(void)
 {
-    uint8_t value;
-    portENTER_CRITICAL(&s_spinlock);
-    value = g_current_brightness;
-    portEXIT_CRITICAL(&s_spinlock);
-    return value;
+    uint8_t val;
+    portENTER_CRITICAL(&s_mux);
+    val = s_brightness;
+    portEXIT_CRITICAL(&s_mux);
+    return val;
 }

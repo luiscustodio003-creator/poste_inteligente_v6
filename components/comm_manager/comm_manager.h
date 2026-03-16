@@ -1,26 +1,31 @@
 /* ============================================================
-   COMM MANAGER — DECLARAÇÃO
-   ------------------------------------------------------------
-   @file      comm_manager.h
-   @brief     Gestão de comunicação entre postes inteligentes
-   @version   3.0
-   @date      2026-03-15
-
+   COMM MANAGER — DECLARACAO
+   ============================================================
    Projecto  : Poste Inteligente
+   Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
 
-   Alterações (v2.0 → v3.0):
-   --------------------------
-   1. Adicionado comm_discover() — envia DISCOVER broadcast
-   2. Adicionado comm_send_status() — propaga estado do poste
-   3. Adicionado comm_get_neighbors() — expõe tabela de vizinhos
-      ao display_manager para mostrar no ecrã
+   Descricao:
+   ----------
+   Camada de abstraccao sobre o udp_manager.
+   Calcula ETA automaticamente com base em POSTE_DIST_M e
+   RADAR_DETECT_M de system_config.h.
+   Gere lideranca MASTER_CLAIM e vizinhos por posicao.
 
-   Dependências:
+   Logica de vizinhos:
+   --------------------
+   Vizinho esq = pos POST_POSITION - 1
+   Vizinho dir = pos POST_POSITION + 1
+   pos=0 nao tem vizinho esquerdo (e sempre master por defeito).
+
+   Logica MASTER:
+   ---------------
+   Poste e MASTER quando vizinho esquerdo esta OFFLINE ou inexistente.
+   pos=0 tem prioridade maxima: ao voltar, propaga MASTER_CLAIM.
+
+   Dependencias:
    -------------
-   - udp_manager.h (neighbor_t, neighbor_status_t)
-   - wifi_manager.h
-   - system_config.h
+   - udp_manager.h, wifi_manager.h, system_config.h
 ============================================================ */
 
 #ifndef COMM_MANAGER_H
@@ -28,33 +33,48 @@
 
 #include <stdbool.h>
 #include <stddef.h>
-#include "udp_manager.h"    /* neighbor_t, neighbor_status_t, MAX_NEIGHBORS */
+#include "udp_manager.h"
 
-/* -----------------------------------------------------------
-   comm_init — Inicializa UDP.
-   ATENÇÃO: wifi_start_auto() deve ser chamado ANTES desta
-   função em app_main(). comm_init() NÃO inicia o Wi-Fi.
-   ----------------------------------------------------------- */
+/* Inicializa UDP -- Wi-Fi deve estar activo antes */
 bool comm_init(void);
 
-/* Envia DISCOVER broadcast para anunciar este poste */
+/* Envia DISCOVER broadcast */
 void comm_discover(void);
 
-/* Envia velocidade de veículo para vizinhos activos */
-bool comm_send_vehicle(float speed);
+/* Envia SPD com ETA calculado para vizinho direito */
+bool comm_send_spd(float speed);
 
-/* Processa mensagem UDP recebida.
-   Retorna true + preenche parâmetros se for SPD.
-   Para DISCOVER/ACK/STATUS processa internamente. */
-bool comm_receive_vehicle(float *speed, int *post_id, int *post_pos);
+/* Envia TC_INC imediato para vizinho direito (carro a caminho) */
+bool comm_send_tc_inc(float speed);
 
-/* Propaga estado deste poste para todos os vizinhos directos */
+/* Notifica vizinho esquerdo que carro passou (ele decrementa T) */
+bool comm_notify_prev_passed(float speed);
+
+/* Propaga MASTER_CLAIM para vizinho direito */
+void comm_send_master_claim(void);
+
+/* Envia STATUS para todos os vizinhos */
 void comm_send_status(neighbor_status_t status);
 
-/* Retorna tabela de vizinhos para mostrar no display */
+/* Vizinho esquerdo (pos-1) ou NULL */
+neighbor_t *comm_get_neighbor_left(void);
+
+/* Vizinho direito (pos+1) ou NULL */
+neighbor_t *comm_get_neighbor_right(void);
+
+/* Tabela completa de vizinhos */
 size_t comm_get_neighbors(neighbor_t *list, size_t max);
 
-/* Verifica se a comunicação está operacional */
+/* true se este poste e MASTER (vizinho esq offline ou inexistente) */
+bool comm_is_master(void);
+
+/* true se comunicacao operacional */
 bool comm_status_ok(void);
+
+/* true se vizinho esquerdo online */
+bool comm_left_online(void);
+
+/* true se vizinho direito online */
+bool comm_right_online(void);
 
 #endif /* COMM_MANAGER_H */

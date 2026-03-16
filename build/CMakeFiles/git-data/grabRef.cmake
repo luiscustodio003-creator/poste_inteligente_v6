@@ -18,7 +18,7 @@ set(HEAD_HASH)
 file(READ "D:/Dev/C/poste_inteligente_v6/build/CMakeFiles/git-data/HEAD" HEAD_CONTENTS LIMIT 1024)
 
 string(STRIP "${HEAD_CONTENTS}" HEAD_CONTENTS)
-set(GIT_DIR "C:/esp/v5.4.3/esp-idf/.git")
+set(GIT_DIR "D:/Dev/C/poste_inteligente_v6/.git")
 # handle git-worktree
 if(EXISTS "${GIT_DIR}/commondir")
 	file(READ "${GIT_DIR}/commondir" GIT_DIR_NEW LIMIT 1024)
