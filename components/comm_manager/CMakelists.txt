@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS "comm_manager.c"
+    INCLUDE_DIRS "."
+    REQUIRES
+        udp_manager     # neighbor_t, neighbor_status_t, funções UDP
+        wifi_manager    # wifi_manager_is_connected()
+        log             # ESP_LOGI / ESP_LOGW / ESP_LOGE
+        config          # system_config.h:
+                        #   POST_POSITION, POSTE_DIST_M,
+                        #   RADAR_DETECT_M, MAX_NEIGHBORS
+)
+ 

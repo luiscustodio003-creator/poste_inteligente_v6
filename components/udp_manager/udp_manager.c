@@ -2,292 +2,553 @@
    UDP MANAGER — IMPLEMENTAÇÃO
    ------------------------------------------------------------
    @file      udp_manager.c
-   @brief     Descoberta automática de vizinhos via UDP broadcast
-   @version   2.1
-   @date      2026-03-19
+   @brief     Comunicação UDP entre postes — protocolo completo
+   @version   3.2
+   @date      2026-03-20
 
    Projecto  : Poste Inteligente
+   Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
 
-   Descrição:
-   ----------
-   Gere a comunicação UDP para descoberta automática de vizinhos
-   na mesma rede Wi-Fi. Envia broadcasts DISCOVER periodicamente
-   e mantém tabela de vizinhos (esquerdo/direito) com timeout.
-
-   CORRECÇÕES v2.0 → v2.1:
+   Alterações v3.1 → v3.2:
    ------------------------
-   1. CORRECÇÃO CRÍTICA: Removidas macros locais UDP_PORT (4210),
-      MAX_NEIGHBORS (2) e DISCOVER_INTERVAL_MS que divergiam dos
-      valores em system_config.h (5005, 4, 5000). Este módulo
-      usa agora exclusivamente os valores de system_config.h.
+   CORRECÇÃO 1: STATUS recebido cria vizinho se não existir.
+                Antes: ignorava STATUS de vizinhos desconhecidos.
+                Agora: STATUS serve também como registo inicial,
+                       usando o IP de origem e o ID do pacote.
 
-   2. CORRECÇÃO: udp_manager_tick() estava declarada no .h sem
-      implementação. Agora implementada: pode ser chamada pelo
-      código externo para forçar um ciclo de manutenção.
+   CORRECÇÃO 2: DISCOVER enviado imediatamente no arranque
+                (s_ultimo_disc = 0 - DISCOVER_INTERVAL_MS).
+                Antes: esperava DISCOVER_INTERVAL_MS antes do
+                primeiro broadcast, causando janela cega.
 
-   3. CORRECÇÃO: NEIGHBOR_TIMEOUT_MS agora vem de system_config.h
-      (era 15000 localmente vs 10000 no system_config.h).
+   CORRECÇÃO 3: udp_manager_get_neighbors() usa position para
+                determinar esq/dir (coerente com comm_manager).
 
-   4. Adicionada validação do socket após criação.
 ============================================================ */
 
 #include "udp_manager.h"
 #include "system_config.h"
 #include "esp_log.h"
+#include "esp_timer.h"
 #include "lwip/sockets.h"
 #include "lwip/inet.h"
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-#include "esp_timer.h"
 #include <string.h>
+#include <stdlib.h>
+#include <stdio.h>
 
-/* Etiqueta de log deste módulo */
 static const char *TAG = "UDP_MGR";
 
 /* ============================================================
-   Estado interno do módulo
+   ESTADO INTERNO
 ============================================================ */
-static int        udp_socket   = -1;
-static neighbor_t neighbors[MAX_NEIGHBORS];
-static uint32_t   last_broadcast = 0;   /* Timestamp último broadcast (ms) */
+static int        s_socket      = -1;
+static bool       s_iniciado    = false;
+static neighbor_t s_vizinhos[MAX_NEIGHBORS];
+
+/* CORRECÇÃO 2: inicializado a 0 menos o intervalo para enviar
+   DISCOVER imediatamente na primeira iteração da task */
+static uint32_t   s_ultimo_disc = 0;
 
 /* ============================================================
-   _get_neighbor_index
-   ------------------------------------------------------------
-   Determina o índice na tabela de vizinhos com base no ID:
-     0 = vizinho esquerdo (poste_id < POSTE_ID)
-     1 = vizinho direito  (poste_id > POSTE_ID)
-    -1 = ignorar (próprio poste ou ID inválido)
+   UTILITÁRIOS
 ============================================================ */
-static int _get_neighbor_index(int poste_id)
+
+static uint32_t _agora_ms(void)
 {
-    if (poste_id < POSTE_ID) return 0; /* esquerda */
-    if (poste_id > POSTE_ID) return 1; /* direita  */
-    return -1;                         /* próprio poste — ignorar */
+    return (uint32_t)(esp_timer_get_time() / 1000ULL);
+}
+
+static const char *_status_str(neighbor_status_t s)
+{
+    switch (s)
+    {
+        case NEIGHBOR_OK:      return "OK";
+        case NEIGHBOR_OFFLINE: return "OFFLINE";
+        case NEIGHBOR_FAIL:    return "FAIL";
+        case NEIGHBOR_SAFE:    return "SAFE";
+        case NEIGHBOR_AUTO:    return "AUTO";
+        default:               return "?";
+    }
+}
+
+static neighbor_status_t _str_to_status(const char *s)
+{
+    if (strcmp(s, "OK")   == 0) return NEIGHBOR_OK;
+    if (strcmp(s, "FAIL") == 0) return NEIGHBOR_FAIL;
+    if (strcmp(s, "SAFE") == 0) return NEIGHBOR_SAFE;
+    if (strcmp(s, "AUTO") == 0) return NEIGHBOR_AUTO;
+    return NEIGHBOR_OFFLINE;
 }
 
 /* ============================================================
-   _send_discover
-   ------------------------------------------------------------
-   Envia mensagem "DISCOVER:<POSTE_ID>" em broadcast UDP.
-   O porto de destino é UDP_PORT (system_config.h).
+   _enviar_para
 ============================================================ */
-static void _send_discover(void)
+static bool _enviar_para(const char *ip, const char *msg)
 {
+    if (s_socket < 0 || !ip || !msg) return false;
+
     struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
     dest.sin_family      = AF_INET;
     dest.sin_port        = htons(UDP_PORT);
-    dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
+    dest.sin_addr.s_addr = inet_addr(ip);
 
-    char msg[32];
-    snprintf(msg, sizeof(msg), "DISCOVER:%d", POSTE_ID);
-
-    int r = sendto(udp_socket, msg, strlen(msg), 0,
+    int r = sendto(s_socket, msg, strlen(msg), 0,
                    (struct sockaddr *)&dest, sizeof(dest));
 
     if (r < 0)
     {
-        ESP_LOGW(TAG, "Falha ao enviar DISCOVER (errno=%d)", errno);
+        ESP_LOGW(TAG, "Falha envio para %s: %s (errno=%d)",
+                 ip, msg, errno);
+        return false;
     }
-    else
-    {
-        ESP_LOGD(TAG, "DISCOVER enviado: %s", msg);
-    }
+
+    ESP_LOGD(TAG, "-> %s : %s", ip, msg);
+    return true;
 }
 
 /* ============================================================
-   _process_message
-   ------------------------------------------------------------
-   Processa uma mensagem UDP recebida. Actualiza a tabela de
-   vizinhos se a mensagem for um DISCOVER válido de outro poste.
+   _encontrar_ou_criar_vizinho
 ============================================================ */
-static void _process_message(char *msg, char *ip)
+static neighbor_t *_encontrar_ou_criar_vizinho(const char *ip,
+                                                int         id,
+                                                int         position)
 {
-    /* Verifica prefixo DISCOVER */
-    if (strncmp(msg, "DISCOVER:", 9) != 0)
-        return;
+    /* Procura entrada existente pelo IP */
+    for (int i = 0; i < MAX_NEIGHBORS; i++)
+    {
+        if (s_vizinhos[i].active &&
+            strcmp(s_vizinhos[i].ip, ip) == 0)
+        {
+            /* Actualiza campos se vierem mais precisos */
+            if (id >= 0)       s_vizinhos[i].id       = id;
+            if (position >= 0) s_vizinhos[i].position = position;
+            return &s_vizinhos[i];
+        }
+    }
 
-    int poste_id = atoi(msg + 9);
+    /* Procura entrada livre */
+    for (int i = 0; i < MAX_NEIGHBORS; i++)
+    {
+        if (!s_vizinhos[i].active)
+        {
+            memset(&s_vizinhos[i], 0, sizeof(neighbor_t));
+            strncpy(s_vizinhos[i].ip, ip,
+                    sizeof(s_vizinhos[i].ip) - 1);
+            s_vizinhos[i].id       = id;
+            s_vizinhos[i].position = position;
+            s_vizinhos[i].status   = NEIGHBOR_OK;
+            s_vizinhos[i].active   = true;
 
-    int idx = _get_neighbor_index(poste_id);
-    if (idx < 0)
-        return; /* Próprio poste ou ID inválido — ignorar */
+            ESP_LOGI(TAG, "Novo vizinho ID=%d pos=%d IP=%s",
+                     id, position, ip);
+            return &s_vizinhos[i];
+        }
+    }
 
-    /* Actualiza entrada na tabela de vizinhos */
-    strncpy(neighbors[idx].ip, ip, sizeof(neighbors[idx].ip) - 1);
-    neighbors[idx].ip[sizeof(neighbors[idx].ip) - 1] = '\0';
-    neighbors[idx].poste_id  = poste_id;
-    neighbors[idx].last_seen = (uint32_t)(esp_timer_get_time() / 1000);
-
-    ESP_LOGI(TAG, "Vizinho %d (%s) actualizado [%s]",
-             poste_id, ip,
-             idx == 0 ? "ESQUERDA" : "DIREITA");
+    ESP_LOGW(TAG, "Tabela cheia (MAX=%d)", MAX_NEIGHBORS);
+    return NULL;
 }
 
 /* ============================================================
-   _check_timeouts
-   ------------------------------------------------------------
-   Verifica expiração dos vizinhos. Se o tempo desde
-   last_seen exceder NEIGHBOR_TIMEOUT_MS, o vizinho é removido.
+   _processar_mensagem
 ============================================================ */
-static void _check_timeouts(uint32_t now_ms)
+static void _processar_mensagem(char *msg, const char *ip_origem)
+{
+    if (!msg || !ip_origem) return;
+
+    /* --- DISCOVER:<id>:<position> --- */
+    if (strncmp(msg, "DISCOVER:", 9) == 0)
+    {
+        char *p  = msg + 9;
+        int   id = atoi(p);
+        if (id == POSTE_ID) return;
+
+        /* Extrai posição — fallback para id se campo ausente */
+        int   pos = id;
+        char *sep = strchr(p, ':');
+        if (sep) pos = atoi(sep + 1);
+
+        neighbor_t *v = _encontrar_ou_criar_vizinho(ip_origem,
+                                                     id, pos);
+        if (v)
+        {
+            v->last_seen    = _agora_ms();
+            v->status       = NEIGHBOR_OK;
+            v->active       = true;
+            v->discover_ok  = true;   /* DISCOVER confirmado — timeout activo */
+
+            ESP_LOGI(TAG, "DISCOVER ID=%d pos=%d IP=%s [%s]",
+                     id, pos, ip_origem,
+                     pos < POST_POSITION ? "ESQ" : "DIR");
+        }
+
+        /* Responde com DISCOVER próprio + STATUS para garantir
+           que o outro poste também nos regista correctamente */
+        char resp[48];
+        //snprintf(resp, sizeof(resp),"STATUS:%d:OK", POSTE_ID);
+        /* Depois (correcto): */
+        snprintf(resp, sizeof(resp), "DISCOVER:%d:%d", POSTE_ID, POST_POSITION);
+        _enviar_para(ip_origem, resp);
+        return;
+    }
+
+    /* --- STATUS:<id>:<estado> --- */
+    if (strncmp(msg, "STATUS:", 7) == 0)
+    {
+        char *p  = msg + 7;
+        int   id = atoi(p);
+        if (id == POSTE_ID) return;
+
+        p = strchr(p, ':'); if (!p) return; p++;
+        neighbor_status_t novo_status = _str_to_status(p);
+
+        /* Se não conhecemos este vizinho, criamos a entrada.
+           Marcamos discover_confirmado=false — o timeout não
+           actua sobre vizinhos sem DISCOVER confirmado ainda. */
+        neighbor_t *v = _encontrar_ou_criar_vizinho(ip_origem,
+                                                     id, id);
+        if (v)
+        {
+            neighbor_status_t ant = v->status;
+            v->status             = novo_status;
+            v->last_seen          = _agora_ms();
+
+            if (ant != novo_status)
+                ESP_LOGI(TAG, "STATUS ID=%d: %s->%s",
+                         id,
+                         _status_str(ant),
+                         _status_str(novo_status));
+        }
+        return;
+    }
+
+    /* --- SPD:<id>:<vel>:<eta_ms>:<dist_m> --- */
+    if (strncmp(msg, "SPD:", 4) == 0)
+    {
+        char    *p   = msg + 4;
+        int      id  = atoi(p);
+        if (id == POSTE_ID) return;
+
+        float    vel  = 0.0f;
+        uint32_t eta  = 0;
+        uint32_t dist = 0;
+
+        p = strchr(p, ':'); if (!p) return; p++;
+        vel = strtof(p, NULL);
+        p = strchr(p, ':'); if (!p) return; p++;
+        eta = (uint32_t)atol(p);
+        p = strchr(p, ':'); if (!p) return; p++;
+        dist = (uint32_t)atol(p);
+
+        ESP_LOGI(TAG, "SPD de ID=%d: %.1fkm/h ETA=%lums",
+                 id, vel, (unsigned long)eta);
+        on_spd_received(vel, eta);
+        return;
+    }
+
+    /* --- TC_INC:<id>:<vel> --- */
+    if (strncmp(msg, "TC_INC:", 7) == 0)
+    {
+        char *p  = msg + 7;
+        int   id = atoi(p);
+        if (id == POSTE_ID) return;
+
+        p = strchr(p, ':'); if (!p) return; p++;
+        float vel = strtof(p, NULL);
+
+        if (vel >= 0.0f)
+        {
+            ESP_LOGI(TAG, "TC_INC+ ID=%d: %.1fkm/h (Tc++)", id, vel);
+            on_tc_inc_received(vel);
+        }
+        else
+        {
+            ESP_LOGI(TAG, "TC_INC- ID=%d (carro passou, T--)", id);
+            on_prev_passed_received();
+        }
+        return;
+    }
+
+    /* --- MASTER_CLAIM:<id> --- */
+    if (strncmp(msg, "MASTER_CLAIM:", 13) == 0)
+    {
+        int id = atoi(msg + 13);
+        if (id == POSTE_ID) return;
+
+        ESP_LOGI(TAG, "MASTER_CLAIM de ID=%d", id);
+        on_master_claim_received(id);
+        return;
+    }
+
+    ESP_LOGD(TAG, "Mensagem desconhecida: %s", msg);
+}
+
+/* ============================================================
+   _verificar_timeouts
+============================================================ */
+static void _verificar_timeouts(uint32_t agora)
 {
     for (int i = 0; i < MAX_NEIGHBORS; i++)
     {
-        if (neighbors[i].ip[0] == '\0')
-            continue; /* Entrada vazia — ignorar */
+        /* Só verifica vizinhos activos E com DISCOVER confirmado.
+           Vizinhos criados apenas por STATUS aguardam o DISCOVER
+           para terem posição correcta — não entram em timeout. */
+        if (!s_vizinhos[i].active)       continue;
+        if (!s_vizinhos[i].discover_ok)  continue;
 
-        if ((now_ms - neighbors[i].last_seen) > NEIGHBOR_TIMEOUT_MS)
+        uint32_t delta = agora - s_vizinhos[i].last_seen;
+
+        if (delta > NEIGHBOR_TIMEOUT_MS &&
+            s_vizinhos[i].status != NEIGHBOR_OFFLINE)
         {
-            ESP_LOGW(TAG, "Vizinho expirado: ID=%d IP=%s",
-                     neighbors[i].poste_id, neighbors[i].ip);
-            memset(&neighbors[i], 0, sizeof(neighbor_t));
+            ESP_LOGW(TAG,
+                     "Vizinho ID=%d IP=%s OFFLINE (%lums sem DISCOVER)",
+                     s_vizinhos[i].id,
+                     s_vizinhos[i].ip,
+                     (unsigned long)delta);
+            s_vizinhos[i].status = NEIGHBOR_OFFLINE;
         }
     }
 }
 
 /* ============================================================
    udp_task
-   ------------------------------------------------------------
-   Task FreeRTOS que corre permanentemente:
-     - Recebe mensagens UDP (recvfrom com timeout implícito)
-     - Envia DISCOVER periodicamente
-     - Verifica expiração de vizinhos
 ============================================================ */
 static void udp_task(void *arg)
 {
-    char               rx_buffer[64];
-    struct sockaddr_in addr;
+    char               rx_buf[128];
+    struct sockaddr_in addr_origem;
 
     ESP_LOGI(TAG, "Task UDP iniciada (porto %d)", UDP_PORT);
 
+    /* CORRECÇÃO 2: envia DISCOVER imediatamente no arranque
+       sem esperar DISCOVER_INTERVAL_MS */
+    udp_manager_discover();
+    s_ultimo_disc = _agora_ms();
+
     while (1)
     {
-        /* --- Recepção --- */
-        socklen_t addr_len = sizeof(addr);
-        int r = recvfrom(udp_socket, rx_buffer, sizeof(rx_buffer) - 1,
-                         0, (struct sockaddr *)&addr, &addr_len);
+        socklen_t addr_len = sizeof(addr_origem);
+        int r = recvfrom(s_socket,
+                         rx_buf, sizeof(rx_buf) - 1,
+                         0,
+                         (struct sockaddr *)&addr_origem,
+                         &addr_len);
 
         if (r > 0)
         {
-            rx_buffer[r] = '\0'; /* Terminar string */
-
-            char ip[16];
-            inet_ntoa_r(addr.sin_addr, ip, sizeof(ip));
-
-            _process_message(rx_buffer, ip);
+            rx_buf[r] = '\0';
+            char ip_str[16];
+            inet_ntoa_r(addr_origem.sin_addr,
+                        ip_str, sizeof(ip_str));
+            _processar_mensagem(rx_buf, ip_str);
         }
 
-        /* --- Broadcast periódico --- */
-        uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+        uint32_t agora = _agora_ms();
 
-        if ((now - last_broadcast) >= DISCOVER_INTERVAL_MS)
+        if ((agora - s_ultimo_disc) >= DISCOVER_INTERVAL_MS)
         {
-            _send_discover();
-            last_broadcast = now;
+            udp_manager_discover();
+            s_ultimo_disc = agora;
         }
 
-        /* --- Verificação de timeouts --- */
-        _check_timeouts(now);
+        _verificar_timeouts(agora);
 
-        /* Cede CPU por 100 ms */
         vTaskDelay(pdMS_TO_TICKS(100));
     }
 }
 
 /* ============================================================
    udp_manager_init
-   ------------------------------------------------------------
-   Inicializa o socket UDP, liga-o ao porto UDP_PORT e
-   arranca a task de gestão UDP.
-   Deve ser chamada após o Wi-Fi estar ligado (IP obtido).
 ============================================================ */
-void udp_manager_init(void)
+bool udp_manager_init(void)
 {
-    memset(neighbors, 0, sizeof(neighbors));
-    last_broadcast = 0;
-
-    /* Cria socket UDP */
-    udp_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
-    if (udp_socket < 0)
+    if (s_iniciado)
     {
-        ESP_LOGE(TAG, "Falha ao criar socket UDP (errno=%d)", errno);
-        return;
+        ESP_LOGW(TAG, "Já iniciado — ignorar");
+        return true;
     }
 
-    /* Activa envio de broadcast */
-    int broadcast = 1;
-    setsockopt(udp_socket, SOL_SOCKET, SO_BROADCAST,
-               &broadcast, sizeof(broadcast));
+    memset(s_vizinhos, 0, sizeof(s_vizinhos));
+    s_ultimo_disc = 0;
 
-    /* Define timeout de recepção para não bloquear indefinidamente */
-    struct timeval timeout = { .tv_sec = 0, .tv_usec = 100000 }; /* 100 ms */
-    setsockopt(udp_socket, SOL_SOCKET, SO_RCVTIMEO,
-               &timeout, sizeof(timeout));
+    s_socket = socket(AF_INET, SOCK_DGRAM, IPPROTO_IP);
+    if (s_socket < 0)
+    {
+        ESP_LOGE(TAG, "Falha socket (errno=%d)", errno);
+        return false;
+    }
 
-    /* Liga ao porto de escuta */
+    int bc = 1;
+    setsockopt(s_socket, SOL_SOCKET, SO_BROADCAST,
+               &bc, sizeof(bc));
+
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
+    setsockopt(s_socket, SOL_SOCKET, SO_RCVTIMEO,
+               &tv, sizeof(tv));
+
     struct sockaddr_in bind_addr;
+    memset(&bind_addr, 0, sizeof(bind_addr));
     bind_addr.sin_family      = AF_INET;
     bind_addr.sin_port        = htons(UDP_PORT);
     bind_addr.sin_addr.s_addr = htonl(INADDR_ANY);
 
-    if (bind(udp_socket, (struct sockaddr *)&bind_addr,
+    if (bind(s_socket,
+             (struct sockaddr *)&bind_addr,
              sizeof(bind_addr)) < 0)
     {
-        ESP_LOGE(TAG, "Falha ao fazer bind no porto %d (errno=%d)",
+        ESP_LOGE(TAG, "Falha bind porto %d (errno=%d)",
                  UDP_PORT, errno);
-        close(udp_socket);
-        udp_socket = -1;
-        return;
+        close(s_socket);
+        s_socket = -1;
+        return false;
     }
 
-    /* Arranca task de gestão UDP */
     xTaskCreate(udp_task, "udp_task", 4096, NULL, 5, NULL);
 
-    ESP_LOGI(TAG, "UDP Manager iniciado no porto %d", UDP_PORT);
+    s_iniciado = true;
+    ESP_LOGI(TAG, "UDP Manager v3.2 pronto (porto %d)", UDP_PORT);
+    return true;
 }
 
 /* ============================================================
-   udp_manager_tick
-   ------------------------------------------------------------
-   Processamento manual de um ciclo de manutenção UDP.
-   Útil se o código externo preferir polling em vez de task.
-   A task interna já faz este ciclo — uso é opcional.
+   udp_manager_discover
+   Formato v3.1+: DISCOVER:<id>:<position>
 ============================================================ */
-void udp_manager_tick(uint32_t ms)
+void udp_manager_discover(void)
 {
-    /* Parâmetro ms reservado para uso futuro (ex: acumulador) */
-    (void)ms;
+    if (s_socket < 0) return;
 
-    uint32_t now = (uint32_t)(esp_timer_get_time() / 1000);
+    struct sockaddr_in dest;
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family      = AF_INET;
+    dest.sin_port        = htons(UDP_PORT);
+    dest.sin_addr.s_addr = htonl(INADDR_BROADCAST);
 
-    if ((now - last_broadcast) >= DISCOVER_INTERVAL_MS)
-    {
-        _send_discover();
-        last_broadcast = now;
-    }
+    char msg[32];
+    snprintf(msg, sizeof(msg),
+             "DISCOVER:%d:%d", POSTE_ID, POST_POSITION);
 
-    _check_timeouts(now);
+    int r = sendto(s_socket, msg, strlen(msg), 0,
+                   (struct sockaddr *)&dest, sizeof(dest));
+
+    if (r < 0)
+        ESP_LOGW(TAG, "Falha DISCOVER (errno=%d)", errno);
+    else
+        ESP_LOGD(TAG, "DISCOVER: %s", msg);
 }
 
 /* ============================================================
-   udp_manager_get_neighbors
-   ------------------------------------------------------------
-   Preenche nebL e nebR com os IPs dos vizinhos conhecidos.
-   Se não houver vizinho, preenche com "---".
-   Buffers devem ter pelo menos 16 bytes.
+   Funções de envio
+============================================================ */
+bool udp_manager_send_spd(const char *ip, float speed,
+                            uint32_t eta_ms, uint32_t dist_m)
+{
+    char msg[64];
+    snprintf(msg, sizeof(msg), "SPD:%d:%.1f:%lu:%lu",
+             POSTE_ID, speed,
+             (unsigned long)eta_ms, (unsigned long)dist_m);
+    return _enviar_para(ip, msg);
+}
+
+bool udp_manager_send_tc_inc(const char *ip, float speed)
+{
+    char msg[32];
+    snprintf(msg, sizeof(msg),
+             "TC_INC:%d:%.1f", POSTE_ID, speed);
+    return _enviar_para(ip, msg);
+}
+
+bool udp_manager_send_status(const char *ip,
+                               neighbor_status_t status)
+{
+    char msg[32];
+    snprintf(msg, sizeof(msg),
+             "STATUS:%d:%s", POSTE_ID, _status_str(status));
+    return _enviar_para(ip, msg);
+}
+
+bool udp_manager_send_master_claim(const char *ip)
+{
+    char msg[32];
+    snprintf(msg, sizeof(msg), "MASTER_CLAIM:%d", POSTE_ID);
+    return _enviar_para(ip, msg);
+}
+
+/* ============================================================
+   udp_manager_get_neighbors — compatibilidade display
 ============================================================ */
 void udp_manager_get_neighbors(char *nebL, char *nebR)
 {
-    if (!nebL || !nebR)
-        return;
+    if (!nebL || !nebR) return;
 
-    strncpy(nebL,
-            neighbors[0].ip[0] ? neighbors[0].ip : "---", 16);
-    nebL[15] = '\0';
+    strncpy(nebL, "---", 16);
+    strncpy(nebR, "---", 16);
 
-    strncpy(nebR,
-            neighbors[1].ip[0] ? neighbors[1].ip : "---", 16);
-    nebR[15] = '\0';
+    for (int i = 0; i < MAX_NEIGHBORS; i++)
+    {
+        if (!s_vizinhos[i].active) continue;
+
+        if (s_vizinhos[i].position < POST_POSITION)
+        {
+            strncpy(nebL, s_vizinhos[i].ip, 15);
+            nebL[15] = '\0';
+        }
+        else if (s_vizinhos[i].position > POST_POSITION)
+        {
+            strncpy(nebR, s_vizinhos[i].ip, 15);
+            nebR[15] = '\0';
+        }
+    }
 }
+
+/* ============================================================
+   udp_manager_get_neighbor_by_pos
+============================================================ */
+neighbor_t *udp_manager_get_neighbor_by_pos(int position)
+{
+    for (int i = 0; i < MAX_NEIGHBORS; i++)
+    {
+        if (s_vizinhos[i].active &&
+            s_vizinhos[i].position == position)
+            return &s_vizinhos[i];
+    }
+    return NULL;
+}
+
+/* ============================================================
+   udp_manager_get_all_neighbors
+============================================================ */
+size_t udp_manager_get_all_neighbors(neighbor_t *list, size_t max)
+{
+    if (!list || max == 0) return 0;
+    size_t n = 0;
+    for (int i = 0; i < MAX_NEIGHBORS && n < max; i++)
+        if (s_vizinhos[i].active)
+            list[n++] = s_vizinhos[i];
+    return n;
+}
+
+/* ============================================================
+   CALLBACKS WEAK
+============================================================ */
+__attribute__((weak))
+void on_tc_inc_received(float speed)
+{ ESP_LOGD(TAG, "on_tc_inc_received(%.1f) sem handler", speed); }
+
+__attribute__((weak))
+void on_prev_passed_received(void)
+{ ESP_LOGD(TAG, "on_prev_passed_received() sem handler"); }
+
+__attribute__((weak))
+void on_spd_received(float speed, uint32_t eta_ms)
+{ ESP_LOGD(TAG, "on_spd_received(%.1f,%lu) sem handler",
+           speed, (unsigned long)eta_ms); }
+
+__attribute__((weak))
+void on_master_claim_received(int from_id)
+{ ESP_LOGD(TAG, "on_master_claim_received(%d) sem handler", from_id); }

@@ -866,6 +866,13 @@ D:/Dev/C/poste_inteligente_v6/build/esp-idf/udp_manager/CMakeFiles/list_install_
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/udp_manager/CMakeFiles/install.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/udp_manager/CMakeFiles/install/local.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/udp_manager/CMakeFiles/install/strip.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/comm_manager/CMakeFiles/__idf_comm_manager.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/comm_manager/CMakeFiles/edit_cache.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/comm_manager/CMakeFiles/rebuild_cache.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/comm_manager/CMakeFiles/list_install_components.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/comm_manager/CMakeFiles/install.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/comm_manager/CMakeFiles/install/local.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/comm_manager/CMakeFiles/install/strip.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/main/CMakeFiles/__idf_main.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/main/CMakeFiles/edit_cache.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/main/CMakeFiles/rebuild_cache.dir

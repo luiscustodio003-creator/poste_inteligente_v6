@@ -29,15 +29,15 @@
    IDENTIFICAÇÃO DO POSTE
    [EDITAR] estas 3 linhas são únicas por poste
 ============================================================ */
-#define POSTE_ID            2         /* ID numérico único (uint8_t) */
-#define POSTE_NAME          "POSTE 02"  /* Nome legível (max 31 chars) */
-#define POST_POSITION       1          /* Posição na cadeia (0=início) */
+#define POSTE_ID            1           /* ID numérico único (uint8_t) */
+#define POSTE_NAME          "POSTE 01"  /* Nome legível (max 31 chars) */
+#define POST_POSITION       0       /* Posição na cadeia (0=início) */
 
 /* ============================================================
    WI-FI STA (DHCP)
 ============================================================ */
-#define WIFI_SSID               "Netdovizinho"   /* SSID da rede Wi-Fi      */
-#define WIFI_PASS               "0325917ea6e4"   /* Password da rede Wi-Fi  */
+#define WIFI_SSID               "wifi"   /* SSID da rede Wi-Fi      */
+#define WIFI_PASS               "123456789"   /* Password da rede Wi-Fi  */
 #define WIFI_RETRY_ATTEMPTS     5                /* Tentativas antes de desistir */
 #define WIFI_RECONNECT_MS       30000            /* Intervalo reconexão background (ms) */
 
@@ -56,8 +56,8 @@
 #define MAX_NEIGHBORS           4       /* Máximo de vizinhos conhecidos */
 #define MAX_IP_LEN              16      /* Tamanho máximo string IP      */
 #define ACK_TIMEOUT_MS          500     /* Timeout espera ACK (ms)       */
-#define NEIGHBOR_TIMEOUT_MS     10000   /* Tempo sem sinal → vizinho expirado (ms) */
-#define DISCOVER_INTERVAL_MS    5000    /* Intervalo entre broadcasts DISCOVER (ms) */
+#define NEIGHBOR_TIMEOUT_MS     2000   /* Tempo sem sinal → vizinho expirado (ms) */
+#define DISCOVER_INTERVAL_MS    8000    /* Intervalo entre broadcasts DISCOVER (ms) */
 
 /* ============================================================
    FÍSICA / RADAR / ILUMINAÇÃO
