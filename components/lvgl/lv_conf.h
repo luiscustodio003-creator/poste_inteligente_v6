@@ -34,6 +34,10 @@
 
 #include <stdint.h>
 
+
+
+
+
 /* ===========================================================
    MEMÓRIA
    =========================================================== */
@@ -86,7 +90,7 @@
    =========================================================== */
 #define LV_FONT_MONTSERRAT_8    0
 #define LV_FONT_MONTSERRAT_10   0
-#define LV_FONT_MONTSERRAT_12   0
+#define LV_FONT_MONTSERRAT_12   1
 #define LV_FONT_MONTSERRAT_14   1   /* Usada em display_manager.c */
 #define LV_FONT_MONTSERRAT_16   1   /* Útil para valores/velocidade */
 #define LV_FONT_MONTSERRAT_20   1   /* Útil para título do poste */
@@ -94,6 +98,7 @@
 #define LV_FONT_MONTSERRAT_28   0
 #define LV_FONT_MONTSERRAT_32   0
 #define LV_FONT_MONTSERRAT_48   0
+
 
 /* CORRECÇÃO: LV_FONT_MONTSERRAT_22 não existe em LVGL 8.3 — removido */
 
@@ -147,6 +152,10 @@
     #define LV_THEME_DEFAULT_TRANSITION_TIME    80
 #define LV_USE_THEME_BASIC      1
 #define LV_USE_THEME_MONO       1
+
+#define LV_COLOR_DEPTH          16   // RGB565 — obrigatório ST7789
+#define LV_COLOR_16_SWAP         1   // 1=BGR | 0=RGB
+#define LV_COLOR_SCREEN_TRANSP   0
 
 #endif /* LV_CONF_H */
 #endif /* Fim do #if 1 */

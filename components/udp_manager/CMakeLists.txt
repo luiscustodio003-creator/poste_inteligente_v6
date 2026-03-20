@@ -2,10 +2,9 @@ idf_component_register(
     SRCS "udp_manager.c"
     INCLUDE_DIRS "."
     REQUIRES
-        wifi_manager
-        config
-        lwip
-        nvs_flash
-        esp_timer
-        log
+        lwip        # sockets UDP
+        esp_timer   # esp_timer_get_time
+        freertos    # xTaskCreate, vTaskDelay
+        log         # ESP_LOGI
+        config      # system_config.h (UDP_PORT, MAX_NEIGHBORS, etc.)
 )

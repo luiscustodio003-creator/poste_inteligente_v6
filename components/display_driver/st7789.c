@@ -9,17 +9,6 @@
    Projecto  : Poste Inteligente
    Plataforma: ESP32 (ESP-IDF)
 
-   Correcções aplicadas (v1.0 → v2.0):
-   -------------------------------------
-   1. Adicionado comando MADCTL (0x36) com valor 0x00 para forçar
-      ordem de cor RGB. Sem este comando, o ST7789 usa BGR por
-      defeito — as cores ficam invertidas (vermelho aparece azul).
-   2. Sequência de inicialização reordenada: COLMOD antes de MADCTL,
-      conforme datasheet ST7789V2.
-   3. Adicionado INVON (0x21) — o ST7789 na maioria dos módulos
-      comerciais 240x240 precisa de inversão de cor activa.
-      Se as cores ainda parecerem erradas, comenta esta linha.
-   4. Comentários em português de Portugal.
 
    Dependências:
    -------------

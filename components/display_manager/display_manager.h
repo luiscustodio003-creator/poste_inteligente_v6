@@ -1,39 +1,47 @@
 /* ============================================================
-   DISPLAY MANAGER — DECLARACAO
-   ============================================================
+   DISPLAY MANAGER — INTERFACE
+   ------------------------------------------------------------
+   @file      display_manager.h
+   @brief     Camada de apresentação LVGL + ST7789 — ecrã 240x240
+   @version   3.0
+   @date      2026-03-20
+
    Projecto  : Poste Inteligente
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
 
-   Descricao:
+   Descrição:
    ----------
-   Gestao do display TFT ST7789 240x240 com LVGL 8.3.
-   Mostra em tempo real todas as informacoes do poste:
-   estado da linha, vizinhos ESQ/DIR, contadores T/Tc,
-   brilho actual, velocidade e estado FSM.
+   Gere o display físico ST7789 e a interface gráfica LVGL.
+   Divide o ecrã em quatro zonas fixas:
 
-   Layout do display 240x240:
-   --------------------------
-   POSTE 01  [MASTER]          <- y=8  nome + estado linha
-   IP: 192.168.4.1             <- y=26 IP com prefixo AP/IP
-   ─────────────────────────   <- separador y=40
-   ESQ: P01 OK  | DIR: P03 OK  <- y=52 vizinhos esq/dir
-   ─────────────────────────   <- separador y=65
-   T:2  Tc:1  VEL: 72 km/h    <- y=77 contadores + velocidade
-   ─────────────────────────   <- separador y=90
-   P02 .4.2 OK   72km  2s      <- y=102 vizinho 1
-   P03 .4.3 OFF  --km 15s      <- y=122 vizinho 2
-   P04 .4.4 SAFE 50km  8s      <- y=142 vizinho 3
-   P05 .4.5 OK   45km  1s      <- y=162 vizinho 4
-   ─────────────────────────   <- separador y=178
-   LUZ: 100%  [LIGHT ON]       <- y=192 brilho + estado FSM
-   ─────────────────────────   <- separador y=208
+     ┌─────────────────────────────┐
+     │  ZONA IDENTIDADE            │  Nome do poste + badge de modo
+     ├─────────────────────────────┤
+     │  ZONA HARDWARE              │  WiFi · Radar · DALI %
+     ├─────────────────────────────┤
+     │  ZONA TRÁFEGO               │  T | Tc | Vel km/h
+     ├─────────────────────────────┤
+     │  ZONA VIZINHOS              │  Esq IP·estado / Dir IP·estado
+     └─────────────────────────────┘
 
-   Dependencias:
+   Notas de utilização:
+   ---------------------
+   - LVGL não é thread-safe: chamar display_manager_task()
+     sempre a partir da mesma task (main_task ou display_task).
+   - display_manager_tick() deve ser chamado a cada 1 ms
+     (via esp_timer ou task dedicada).
+   - Todas as funções set_* são seguras para chamar de qualquer
+     task — usam apenas variáveis de estado; o LVGL actualiza
+     no próximo ciclo de display_manager_task().
+
+   Dependências:
    -------------
-   - st7789.h, lvgl.h
-   - udp_manager.h (neighbor_t)
-   - freertos, esp_timer
+   - st7789.h         : driver SPI do display físico
+   - system_config.h  : LCD_H_RES, LCD_V_RES, POSTE_NAME
+   - hw_config.h      : LCD_PIN_*
+   - lvgl             : biblioteca de UI (v8.3.x)
+
 ============================================================ */
 
 #ifndef DISPLAY_MANAGER_H
@@ -41,32 +49,108 @@
 
 #include <stdbool.h>
 #include <stdint.h>
-#include <stddef.h>
-#include "udp_manager.h"
 
-/* Inicializa display, LVGL e cria lvgl_task */
-void display_manager_start(void);
+/* ============================================================
+   INICIALIZAÇÃO
+============================================================ */
 
-/* Actualiza prefixo IP: "AP: x.x.x.x" ou "IP: x.x.x.x" */
-void display_manager_set_ap_mode(bool ap_active, const char *ip);
+/**
+ * @brief Inicializa o display ST7789, o LVGL e cria a UI completa.
+ *        Deve ser chamada uma única vez em app_main(), antes de
+ *        qualquer outra função deste módulo.
+ */
+void display_manager_init(void);
 
-/* Actualiza linha de vizinhos ESQ e DIR */
-void display_manager_update_neighbors_lr(const char *esq_str,
-                                          const char *dir_str);
+/* ============================================================
+   CICLO DE VIDA LVGL
+============================================================ */
 
-/* Actualiza contadores T, Tc e velocidade */
-void display_manager_update_traffic(int T, int Tc, int vel_kmh);
+/**
+ * @brief Notifica o LVGL do tempo decorrido.
+ *        Chamar periodicamente (ex: a cada 1 ms via timer).
+ * @param ms Milissegundos decorridos desde a última chamada
+ */
+void display_manager_tick(uint32_t ms);
 
-/* Actualiza tabela de vizinhos completa */
-void display_manager_update_neighbors(const neighbor_t *neighbors,
-                                       size_t            count);
+/**
+ * @brief Processa eventos e timers internos do LVGL.
+ *        Chamar periodicamente a partir da task de display
+ *        (tipicamente a cada 5–10 ms).
+ */
+void display_manager_task(void);
 
-/* Actualiza nome do poste e estado da linha */
-void display_manager_update_info(const char *poste_name,
-                                  const char *estado_linha);
+/* ============================================================
+   ZONA IDENTIDADE — nome do poste e modo da FSM
+============================================================ */
 
-/* Actualiza brilho actual e estado FSM com cor dinamica */
-void display_manager_update_brightness(uint8_t     brightness,
-                                        const char *state_name);
+/**
+ * @brief Actualiza o badge de modo/estado da FSM.
+ *        Texto e cor mudam conforme o estado:
+ *          "IDLE"     → cinzento
+ *          "LIGHT ON" → amarelo
+ *          "SAFE MODE"→ laranja
+ *          "MASTER"   → verde
+ *          "AUTÓNOMO" → vermelho
+ * @param status String do estado (ex: "IDLE", "LIGHT ON", ...)
+ */
+void display_manager_set_status(const char *status);
+
+/**
+ * @brief Activa ou desactiva indicador visual de liderança MASTER.
+ *        Quando true, o badge fica verde com texto "MASTER".
+ * @param is_leader true se este poste é o líder da cadeia
+ */
+void display_manager_set_leader(bool is_leader);
+
+/* ============================================================
+   ZONA HARDWARE — WiFi, Radar, DALI
+============================================================ */
+
+/**
+ * @brief Actualiza o estado Wi-Fi e IP no display.
+ * @param connected true se Wi-Fi ligado, false caso contrário
+ * @param ip        String com o endereço IP (NULL → "---")
+ */
+void display_manager_set_wifi(bool connected, const char *ip);
+
+/**
+ * @brief Actualiza o estado do radar e o brilho DALI.
+ * @param radar_ok   true se radar operacional, false se em falha
+ * @param brightness Brilho actual da luminária (0–100 %)
+ */
+void display_manager_set_hardware(bool radar_ok, uint8_t brightness);
+
+/* ============================================================
+   ZONA TRÁFEGO — contadores T, Tc e velocidade
+============================================================ */
+
+/**
+ * @brief Actualiza os contadores de tráfego T e Tc.
+ * @param T  Carros confirmados pelo radar local (presentes)
+ * @param Tc Carros a caminho anunciados via UDP
+ */
+void display_manager_set_traffic(int T, int Tc);
+
+/**
+ * @brief Actualiza a velocidade do último carro detectado.
+ * @param speed Velocidade em km/h (0 = sem detecção activa)
+ */
+void display_manager_set_speed(int speed);
+
+/* ============================================================
+   ZONA VIZINHOS — estado da cadeia UDP
+============================================================ */
+
+/**
+ * @brief Actualiza os IPs e estados dos vizinhos esq e dir.
+ * @param nebL   IP do vizinho esquerdo (NULL → "---")
+ * @param nebR   IP do vizinho direito  (NULL → "---")
+ * @param leftOk  true se vizinho esquerdo está online
+ * @param rightOk true se vizinho direito está online
+ */
+void display_manager_set_neighbors(const char *nebL,
+                                   const char *nebR,
+                                   bool        leftOk,
+                                   bool        rightOk);
 
 #endif /* DISPLAY_MANAGER_H */

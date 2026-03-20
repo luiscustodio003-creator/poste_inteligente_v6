@@ -23,31 +23,31 @@
 #ifndef HW_CONFIG_H
 #define HW_CONFIG_H
 
-/* ===========================================================
+/* ============================================================
    DISPLAY TFT ST7789 — SPI
-   =========================================================== */
-#define LCD_PIN_SDA     23      /* MOSI */
-#define LCD_PIN_SCL     18      /* SCLK */
-#define LCD_PIN_CS       5      /* Chip Select */
-#define LCD_PIN_DC      32      /* Data/Command */
-#define LCD_PIN_RST     33      /* Reset */
-#define LCD_PIN_BL      25      /* Backlight */
+============================================================ */
+#define LCD_PIN_SDA     23      /* MOSI                          */
+#define LCD_PIN_SCL     18      /* SCLK                          */
+#define LCD_PIN_CS       5      /* Chip Select                   */
+#define LCD_PIN_DC      32      /* Data/Command                  */
+#define LCD_PIN_RST     33      /* Reset                         */
+#define LCD_PIN_BL      25      /* Backlight                     */
 
-/* Resolução do ecrã */
+/* Resolução do ecrã — deve coincidir com system_config.h */
 #define LCD_H_RES       240
 #define LCD_V_RES       240
 
-/* ===========================================================
+/* ============================================================
    RADAR HLK-LD2450 — UART
-   =========================================================== */
-#define RADAR_UART_PORT     UART_NUM_2  /* UART2 do ESP32        */
-#define RADAR_PIN_TX        17          /* TX do ESP32 → RX radar */
-#define RADAR_PIN_RX        16          /* RX do ESP32 ← TX radar */
+============================================================ */
+#define RADAR_UART_PORT     UART_NUM_2  /* UART2 do ESP32          */
+#define RADAR_PIN_TX        17          /* TX do ESP32 → RX radar  */
+#define RADAR_PIN_RX        16          /* RX do ESP32 ← TX radar  */
 #define RADAR_BAUD_RATE     256000      /* Baud rate do HLK-LD2450 */
 
-/* ===========================================================
+/* ============================================================
    LUMINÁRIA — PWM (LEDC)
-   =========================================================== */
+============================================================ */
 #define LED_PWM_PIN         26          /* Pino PWM para controlo DALI/dimmer */
 
 #endif /* HW_CONFIG_H */
