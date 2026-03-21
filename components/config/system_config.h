@@ -56,8 +56,8 @@
 #define MAX_NEIGHBORS           4       /* Máximo de vizinhos conhecidos */
 #define MAX_IP_LEN              16      /* Tamanho máximo string IP      */
 #define ACK_TIMEOUT_MS          500     /* Timeout espera ACK (ms)       */
-#define NEIGHBOR_TIMEOUT_MS     2000   /* Tempo sem sinal → vizinho expirado (ms) */
-#define DISCOVER_INTERVAL_MS    8000    /* Intervalo entre broadcasts DISCOVER (ms) */
+#define NEIGHBOR_TIMEOUT_MS     8000   /* Tempo sem sinal → vizinho expirado (ms) */
+#define DISCOVER_INTERVAL_MS    2000    /* Intervalo entre broadcasts DISCOVER (ms) */
 
 /* ============================================================
    FÍSICA / RADAR / ILUMINAÇÃO
