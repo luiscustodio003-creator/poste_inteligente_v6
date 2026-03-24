@@ -88,4 +88,7 @@ $<TARGET_FILE:__idf_display_manager>
 $<TARGET_FILE:__idf_wifi_manager>
 $<TARGET_FILE:__idf_udp_manager>
 $<TARGET_FILE:__idf_comm_manager>
+$<TARGET_FILE:__idf_dali_manager>
+$<TARGET_FILE:__idf_radar_manager>
+$<TARGET_FILE:__idf_state_machine>
 $<TARGET_FILE:__idf_main>

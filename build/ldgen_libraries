@@ -88,4 +88,7 @@ D:/Dev/C/poste_inteligente_v6/build/esp-idf/display_manager/libdisplay_manager.a
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/wifi_manager/libwifi_manager.a
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/udp_manager/libudp_manager.a
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/comm_manager/libcomm_manager.a
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/dali_manager/libdali_manager.a
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/libradar_manager.a
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/state_machine/libstate_machine.a
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/main/libmain.a

@@ -1,203 +1,221 @@
 /* ============================================================
-   DRIVER ST7789 — IMPLEMENTAÇÃO
+   ST7789 — IMPLEMENTAÇÃO
    ------------------------------------------------------------
    @file      st7789.c
    @brief     Driver SPI para display TFT ST7789 240x240
-   @version   2.0
-   @date      2026-03-15
+   @version   4.0
+   @date      2026-03-23
 
    Projecto  : Poste Inteligente
    Plataforma: ESP32 (ESP-IDF)
 
+   Descrição:
+   ----------
+   Driver SPI completo para o controlador ST7789.
+   Compatível com LVGL (flush via draw_bitmap).
 
-   Dependências:
-   -------------
-   - hw_config.h  (pinos GPIO e resolução)
-   - ESP-IDF: driver/spi_master, driver/gpio, freertos
+   Características:
+   ----------------
+   - SPI HSPI (SPI2_HOST)
+   - RGB565
+   - Suporte a LVGL
+   - Backlight controlado por GPIO
+   - Configuração de cor ajustável (MADCTL)
+
 ============================================================ */
 
 #include "st7789.h"
-#include "hw_config.h"
 
 #include "driver/spi_master.h"
 #include "driver/gpio.h"
-
 #include "freertos/FreeRTOS.h"
 #include "freertos/task.h"
-
 #include "esp_log.h"
 
 static const char *TAG = "ST7789";
 
-/* Handle do dispositivo SPI */
+/* Handle SPI */
 static spi_device_handle_t spi;
 
-/* -----------------------------------------------------------
-   Envia um byte de comando ao controlador ST7789.
-   DC = 0 indica modo comando.
-   ----------------------------------------------------------- */
-static void cmd(uint8_t c)
+/* ============================================================
+   CONTROLO DC
+============================================================ */
+static inline void dc_cmd(void)
 {
-    gpio_set_level(LCD_PIN_DC, 0);  /* DC baixo = comando */
+    gpio_set_level(LCD_PIN_DC, 0);
+}
 
+static inline void dc_data(void)
+{
+    gpio_set_level(LCD_PIN_DC, 1);
+}
+
+/* ============================================================
+   ENVIO SPI
+============================================================ */
+static void write_cmd(uint8_t cmd)
+{
     spi_transaction_t t = {0};
-    t.length    = 8;
-    t.tx_buffer = &c;
+
+    dc_cmd();
+
+    t.length = 8;
+    t.tx_buffer = &cmd;
 
     spi_device_transmit(spi, &t);
 }
 
-/* -----------------------------------------------------------
-   Envia dados ao controlador ST7789.
-   DC = 1 indica modo dados.
-   ----------------------------------------------------------- */
-static void data(const void *data, int len)
+static void write_data(const uint8_t *data, int len)
 {
-    gpio_set_level(LCD_PIN_DC, 1);  /* DC alto = dados */
+    if (len == 0) return;
 
     spi_transaction_t t = {0};
-    t.length    = len * 8;
+
+    dc_data();
+
+    t.length = len * 8;
     t.tx_buffer = data;
 
     spi_device_transmit(spi, &t);
 }
 
-/* -----------------------------------------------------------
-   Define a janela de endereçamento activa (CASET + RASET).
-   Todos os desenhos subsequentes ocorrem nesta região.
-   x0,y0 — canto superior esquerdo
-   x1,y1 — canto inferior direito (inclusivo)
-   ----------------------------------------------------------- */
-static void set_window(int x0, int y0, int x1, int y1)
+/* ============================================================
+   RESET HARDWARE
+============================================================ */
+static void reset_display(void)
 {
-    uint8_t d[4];
+    gpio_set_level(LCD_PIN_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(50));
 
-    /* CASET — Column Address Set */
-    cmd(0x2A);
-    d[0] = x0 >> 8;
-    d[1] = x0 & 0xFF;
-    d[2] = x1 >> 8;
-    d[3] = x1 & 0xFF;
-    data(d, 4);
-
-    /* RASET — Row Address Set */
-    cmd(0x2B);
-    d[0] = y0 >> 8;
-    d[1] = y0 & 0xFF;
-    d[2] = y1 >> 8;
-    d[3] = y1 & 0xFF;
-    data(d, 4);
-
-    /* RAMWR — Memory Write (inicia escrita de pixels) */
-    cmd(0x2C);
+    gpio_set_level(LCD_PIN_RST, 1);
+    vTaskDelay(pdMS_TO_TICKS(50));
 }
 
-/* -----------------------------------------------------------
-   Desenha um bitmap RGB565 numa posição e dimensão dadas.
-   x,y   — canto superior esquerdo
-   w,h   — largura e altura em pixels
-   data_ptr — array de pixels no formato RGB565 (big-endian)
-   ----------------------------------------------------------- */
-void st7789_draw_bitmap(int x, int y, int w, int h, const uint16_t *data_ptr)
-{
-    set_window(x, y, x + w - 1, y + h - 1);
-    data(data_ptr, w * h * 2);  /* 2 bytes por pixel (RGB565) */
-}
-
-/* -----------------------------------------------------------
-   Preenche o ecrã inteiro com uma cor sólida.
-   color — cor no formato RGB565
-   ----------------------------------------------------------- */
-void st7789_fill(uint16_t color)
-{
-    static uint16_t line[LCD_H_RES];
-
-    /* Preenche o buffer de linha com a cor desejada */
-    for (int i = 0; i < LCD_H_RES; i++)
-        line[i] = color;
-
-    /* Envia linha a linha para o display */
-    for (int y = 0; y < LCD_V_RES; y++)
-        st7789_draw_bitmap(0, y, LCD_H_RES, 1, line);
-}
-
-/* -----------------------------------------------------------
-   Inicializa o display ST7789.
-
-   Sequência de inicialização (datasheet ST7789V2):
-     1. Reset hardware
-     2. SLPOUT — sai do modo sleep
-     3. COLMOD — define formato de cor (RGB565)
-     4. MADCTL — define ordem de memória e ordem de cor (RGB)
-     5. INVON  — inversão de cor (necessária na maioria dos
-                  módulos comerciais 240x240)
-     6. DISPON — liga o display
-   ----------------------------------------------------------- */
+/* ============================================================
+   INICIALIZAÇÃO
+============================================================ */
 void st7789_init(void)
 {
-    ESP_LOGI(TAG, "Inicializar ST7789");
+    ESP_LOGI(TAG, "Inicializar ST7789...");
 
-    /* Configura pinos de controlo como saída */
+    /* --- Configuração GPIO --- */
     gpio_set_direction(LCD_PIN_DC,  GPIO_MODE_OUTPUT);
     gpio_set_direction(LCD_PIN_RST, GPIO_MODE_OUTPUT);
     gpio_set_direction(LCD_PIN_BL,  GPIO_MODE_OUTPUT);
+    gpio_set_direction(LCD_PIN_CS,  GPIO_MODE_OUTPUT);
 
-    /* Reset hardware: pulso baixo de 50 ms */
-    gpio_set_level(LCD_PIN_RST, 0);
-    vTaskDelay(pdMS_TO_TICKS(50));
-    gpio_set_level(LCD_PIN_RST, 1);
-    vTaskDelay(pdMS_TO_TICKS(50));  /* Aguarda estabilização após reset */
+    /* Backlight OFF inicialmente */
+    gpio_set_level(LCD_PIN_BL, 0);
 
-    /* Inicializa barramento SPI */
+    /* Reset hardware */
+    reset_display();
+
+    /* --- Configuração SPI --- */
     spi_bus_config_t buscfg = {
-        .mosi_io_num   = LCD_PIN_SDA,
-        .miso_io_num   = -1,            /* MISO não utilizado */
-        .sclk_io_num   = LCD_PIN_SCL,
+        .mosi_io_num     = LCD_PIN_SDA,
+        .miso_io_num     = -1,
+        .sclk_io_num     = LCD_PIN_SCL,
+        .quadwp_io_num   = -1,
+        .quadhd_io_num   = -1,
         .max_transfer_sz = LCD_H_RES * 40 * 2
     };
-    spi_bus_initialize(HSPI_HOST, &buscfg, SPI_DMA_CH_AUTO);
 
-    /* Configura dispositivo SPI */
+    ESP_ERROR_CHECK(spi_bus_initialize(SPI2_HOST, &buscfg, SPI_DMA_CH_AUTO));
+
     spi_device_interface_config_t devcfg = {
-        .clock_speed_hz = 20000000,         /* 20 MHz */
-        .mode           = 0,                /* SPI modo 0 (CPOL=0, CPHA=0) */
+        .clock_speed_hz = 20000000,
+        .mode           = 0,
         .spics_io_num   = LCD_PIN_CS,
         .queue_size     = 7,
         .flags          = SPI_DEVICE_HALFDUPLEX
     };
-    spi_bus_add_device(HSPI_HOST, &devcfg, &spi);
 
-    /* Liga retroiluminação */
-    gpio_set_level(LCD_PIN_BL, 1);
+    ESP_ERROR_CHECK(spi_bus_add_device(SPI2_HOST, &devcfg, &spi));
 
-    /* --- Sequência de inicialização do ST7789 --- */
+    /* =========================================================
+       SEQUÊNCIA ST7789
+    ========================================================= */
 
-    /* 1. SLPOUT — sai do modo sleep, aguarda 120 ms obrigatórios */
-    cmd(0x11);
+    /* Sleep out */
+    write_cmd(0x11);
     vTaskDelay(pdMS_TO_TICKS(120));
 
-    /* 2. COLMOD — formato de cor: 0x55 = RGB565 (16 bits por pixel) */
-    cmd(0x3A);
+    /* RGB565 */
+    write_cmd(0x3A);
     uint8_t colmod = 0x55;
-    data(&colmod, 1);
+    write_data(&colmod, 1);
 
-    /* 3. MADCTL — Memory Access Control
-       CORRECÇÃO: Este comando define a ordem dos bytes de cor.
-       0x00 = ordem RGB normal (sem espelho, sem rotação, RGB)
-       Se as cores ainda aparecerem invertidas, experimenta 0x08
-       (activa o bit BGR). Depende do módulo físico utilizado.    */
-    cmd(0x36);
+    /* MADCTL — TESTAR SE NECESSÁRIO:
+       0x00 → RGB normal
+       0x08 → BGR (se cores trocadas) */
+    write_cmd(0x36);
     uint8_t madctl = 0x00;
-    data(&madctl, 1);
+    write_data(&madctl, 1);
 
-    /* 4. INVON — Inversão de cor activa
-       A maioria dos módulos comerciais 240x240 com ST7789 precisa
-       desta inversão para as cores aparecerem correctas.
-       Se as cores ficarem negativas/invertidas, comenta esta linha. */
-    cmd(0x21);
+    /* Inversão (comentar se cores estranhas) */
+    write_cmd(0x21);
 
-    /* 5. DISPON — liga o display */
-    cmd(0x29);
+    /* Display ON */
+    write_cmd(0x29);
 
-    ESP_LOGI(TAG, "Display ST7789 pronto");
+    /* Backlight ON */
+    gpio_set_level(LCD_PIN_BL, 1);
+
+    ESP_LOGI(TAG, "ST7789 pronto");
+}
+
+/* ============================================================
+   JANELA DE ESCRITA
+============================================================ */
+void st7789_set_window(uint16_t x0, uint16_t y0,
+                       uint16_t x1, uint16_t y1)
+{
+    uint8_t data[4];
+
+    /* Colunas */
+    write_cmd(0x2A);
+    data[0] = x0 >> 8;
+    data[1] = x0 & 0xFF;
+    data[2] = x1 >> 8;
+    data[3] = x1 & 0xFF;
+    write_data(data, 4);
+
+    /* Linhas */
+    write_cmd(0x2B);
+    data[0] = y0 >> 8;
+    data[1] = y0 & 0xFF;
+    data[2] = y1 >> 8;
+    data[3] = y1 & 0xFF;
+    write_data(data, 4);
+
+    /* RAM write */
+    write_cmd(0x2C);
+}
+
+/* ============================================================
+   DRAW BITMAP — LVGL
+============================================================ */
+void st7789_draw_bitmap(uint16_t x, uint16_t y,
+                        uint16_t w, uint16_t h,
+                        const uint16_t *data)
+{
+    if (!data || w == 0 || h == 0) return;
+
+    st7789_set_window(x, y, x + w - 1, y + h - 1);
+
+    dc_data();
+
+    spi_transaction_t t = {0};
+    t.length    = w * h * 16;
+    t.tx_buffer = data;
+
+    spi_device_transmit(spi, &t);
+}
+
+/* ============================================================
+   BACKLIGHT
+============================================================ */
+void st7789_backlight(bool on)
+{
+    gpio_set_level(LCD_PIN_BL, on ? 1 : 0);
 }

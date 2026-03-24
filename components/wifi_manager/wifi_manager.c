@@ -3,8 +3,8 @@
    ------------------------------------------------------------
    @file      wifi_manager.c
    @brief     Gestão da ligação Wi-Fi STA (DHCP)
-   @version   1.4
-   @date      2026-03-19
+   @version   1.5
+   @date      2026-03-23
 
    Projecto  : Poste Inteligente
    Estudantes: Luis Custodio | Tiago Moreno
@@ -13,14 +13,20 @@
    Descrição:
    ----------
    Gere a ligação Wi-Fi em modo STA com DHCP. Quando o estado
-   muda (ligado/desligado/IP obtido), notifica o display_manager
-   chamando display_manager_set_wifi(). Esta dependência é
-   unidireccional — o display_manager não depende do wifi_manager,
-   resolvendo a dependência circular anterior.
+   muda (ligado/desligado/IP obtido), o main.c deteta a mudança
+   via wifi_manager_is_connected() e chama display_manager_set_wifi().
+   Esta versão (v1.5) remove a dependência directa do display_manager
+   para eliminar a dependência circular no grafo de build do ESP-IDF.
+
+   Alterações v1.4 → v1.5:
+   ------------------------
+   1. Removido #include "display_manager.h"
+   2. Removidas chamadas display_manager_set_wifi() do handler
+   3. Removido display_manager do REQUIRES do CMakeLists
+   O main.c (que depende de ambos) faz a ponte no ciclo de 500ms.
 ============================================================ */
 
 #include "wifi_manager.h"
-#include "display_manager.h"   /* Para notificar estado Wi-Fi no display */
 #include "system_config.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
@@ -59,9 +65,7 @@ static void wifi_event_handler(void *arg,
         {
             wifi_connected = false;
             strncpy(ip_addr, "---", sizeof(ip_addr));
-
-            /* Notifica display — Wi-Fi desligado */
-            display_manager_set_wifi(false, NULL);
+            /* Notificação do display feita pelo main.c no ciclo de 500ms */
 
             if (retry_count < WIFI_RETRY_ATTEMPTS)
             {
@@ -104,9 +108,7 @@ static void wifi_event_handler(void *arg,
         retry_count    = 0;
 
         ESP_LOGI(TAG, "Wi-Fi ligado | IP: %s", ip_addr);
-
-        /* Notifica display — Wi-Fi ligado com IP */
-        display_manager_set_wifi(true, ip_addr);
+        /* Notificação do display feita pelo main.c no ciclo de 500ms */
     }
 }
 
@@ -119,9 +121,11 @@ static void wifi_event_handler(void *arg,
 ============================================================ */
 void wifi_manager_init(void)
 {
-    /* Inicializa abstracção de rede e loop de eventos */
-    esp_netif_init();
-    esp_event_loop_create_default();
+    /* NOTA: esp_netif_init() e esp_event_loop_create_default()
+       são chamados em main.c antes desta função.
+       Chamá-los aqui causaria ESP_ERR_INVALID_STATE.            */
+
+    /* Cria interface STA padrão */
     esp_netif_create_default_wifi_sta();
 
     /* Inicializa stack Wi-Fi com configuração por omissão */

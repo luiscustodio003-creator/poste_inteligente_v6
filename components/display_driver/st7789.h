@@ -1,56 +1,49 @@
 /* ============================================================
-   ST7789 — DECLARAÇÃO
+   ST7789 — INTERFACE
    ------------------------------------------------------------
    @file      st7789.h
-   @brief     Driver SPI para display TFT ST7789 240x240
-   @version   2.1
-   @date      2026-03-19
+   @brief     Driver SPI para display TFT ST7789 (240x240)
+   @version   4.0
+   @date      2026-03-23
 
    Projecto  : Poste Inteligente
    Plataforma: ESP32 (ESP-IDF)
 
    Descrição:
    ----------
-   Interface pública do driver SPI para o controlador ST7789.
-   Fornece inicialização, preenchimento de ecrã e escrita
-   de bitmaps RGB565. Utilizado exclusivamente pelo
-   display_manager através do callback LVGL st7789_flush_cb().
+   Interface do driver ST7789 para comunicação SPI.
+   Totalmente compatível com LVGL (flush callback).
 
    Dependências:
    -------------
-   - hw_config.h  : pinos GPIO (LCD_PIN_*) e resolução (LCD_*_RES)
-   - driver       : spi_master, gpio (ESP-IDF)
-   - freertos     : vTaskDelay
-
-============================================================ */
+   - hw_config.h  : definição de pinos LCD_PIN_*
+   - driver/spi_master
+   ============================================================ */
 
 #ifndef ST7789_H
 #define ST7789_H
 
 #include <stdint.h>
+#include <stdbool.h>
+#include "hw_config.h"
 
-/**
- * @brief Inicializa SPI, efectua reset hardware e executa
- *        a sequência de inicialização do ST7789.
- *        Deve ser chamada antes de qualquer outra função.
- */
+/* ============================================================
+   API PÚBLICA
+============================================================ */
+
+/* Inicializa o display */
 void st7789_init(void);
 
-/**
- * @brief Preenche o ecrã inteiro com uma cor sólida.
- * @param color Cor no formato RGB565 (big-endian)
- */
-void st7789_fill(uint16_t color);
+/* Define janela activa de escrita */
+void st7789_set_window(uint16_t x0, uint16_t y0,
+                       uint16_t x1, uint16_t y1);
 
-/**
- * @brief Escreve um bitmap RGB565 numa região do ecrã.
- * @param x      Coluna inicial (0 a LCD_H_RES-1)
- * @param y      Linha inicial  (0 a LCD_V_RES-1)
- * @param w      Largura em pixels
- * @param h      Altura em pixels
- * @param data   Array de pixels RGB565 (w * h elementos)
- */
-void st7789_draw_bitmap(int x, int y, int w, int h,
+/* Escreve bitmap RGB565 (usado pelo LVGL) */
+void st7789_draw_bitmap(uint16_t x, uint16_t y,
+                        uint16_t w, uint16_t h,
                         const uint16_t *data);
+
+/* Controla backlight */
+void st7789_backlight(bool on);
 
 #endif /* ST7789_H */

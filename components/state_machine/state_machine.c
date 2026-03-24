@@ -3,9 +3,7 @@
    ------------------------------------------------------------
    @file      state_machine.c
    @brief     Máquina de estados do Poste Inteligente
-   @version   2.0
-   @date      2026-03-20
-
+   
    Projecto  : Poste Inteligente
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
@@ -194,8 +192,12 @@ void sm_on_radar_detect(float vel)
 
     /* Converte Tc→T: carro era "a caminho", agora chegou */
     if (s_Tc > 0) s_Tc--;
-    s_T++;
+    /* T++ com limite superior — evita crescimento indefinido
+       por leituras duplicadas ou frames UART repetidos        */
+    if (s_T < MAX_RADAR_TARGETS) s_T++;
 
+    /* Guarda timestamp da última detecção (usado pelo timeout de Tc) */
+    s_last_detect_ms = _agora_ms();
     /* Acende imediatamente */
     dali_set_brightness(LIGHT_MAX);
     s_state = STATE_LIGHT_ON;

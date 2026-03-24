@@ -12,6 +12,8 @@ idf_component_register(
         state_machine   # state_machine_*, sm_inject_test_car
         nvs_flash       # nvs_flash_init
         freertos        # xTaskCreate, vTaskDelay
-        esp_timer       # esp_timer_get_time (teste simulado)
+        esp_timer       # esp_timer_get_time
+        esp_netif       # esp_netif_init() — movido do wifi_manager para aqui
+        esp_event       # esp_event_loop_create_default() — idem
         log             # ESP_LOGI
 )
