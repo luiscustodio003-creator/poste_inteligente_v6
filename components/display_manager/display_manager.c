@@ -76,8 +76,8 @@ static const char *TAG = "DISP_MGR";
 #define COR_BRANCO      0xFFFFFF
 #define COR_PRETO       0x000000
 #define COR_CINZENTO    0x888780
-#define COR_VERDE       0x22C55E
-#define COR_VERMELHO    0xEF4444
+#define COR_VERDE       0xC00028
+#define COR_VERMELHO    0x001840
 #define COR_AMARELO     0xFACC15
 #define COR_LARANJA     0xFFBF00
 #define COR_CIANO       0x22D3EE
@@ -569,7 +569,7 @@ static void ui_create(void)
     label_radar_st = _label_novo(scr, 140, 39, COR_CINZENTO, "Radar: ---");
 
     /* Linha 2 — Vizinho esquerdo */
-    label_neb_esq = _label_novo(scr, 8, 57, COR_CINZENTO, "Esq: ---");
+    label_neb_esq = _label_novo(scr, 8, 57, COR_VERDE, "Esq: ---");
 
     /* Divisor vertical central entre vizinhos */
     lv_obj_t *div_neb = lv_obj_create(scr);
@@ -580,10 +580,10 @@ static void ui_create(void)
     lv_obj_set_style_pad_all(div_neb, 0, 0);
 
     /* Linha 2 — Vizinho direito */
-    label_neb_dir = _label_novo(scr,LCD_H_RES / 2 + 4, 57,COR_CINZENTO, "Dir: ---");
+    label_neb_dir = _label_novo(scr,LCD_H_RES / 2 + 4, 57,COR_VERDE, "Dir: ---");
 
     /* Linha 3 — Texto DALI */
-    label_dali = _label_novo(scr, 8, 76, COR_CINZENTO, "DALI:  0%");
+    label_dali = _label_novo(scr, 8, 76, COR_VERDE, "DALI:  0%");
 
     /* Linha 3 — Barra de brilho DALI */
     bar_dali = lv_bar_create(scr);
@@ -615,8 +615,7 @@ static void ui_create(void)
     const uint32_t COR_CARD[3] = {COR_AMARELO, COR_CIANO, COR_VIOLETA};
     const char *TITULO_CARD[3] = {"T (aqui)", "Tc (vem)", "km/h"};
     const int   CX_ARR[3]      = {CX0, CX1, CX2};
-    lv_obj_t  **VAL_LABELS[3]  = {&label_T_val, &label_Tc_val,
-                                   &label_vel_val};
+    lv_obj_t  **VAL_LABELS[3]  = {&label_T_val, &label_Tc_val,&label_vel_val};
 
     for (int i = 0; i < 3; i++) {
         /* Fundo do card */
@@ -816,15 +815,12 @@ void display_manager_set_wifi(bool connected, const char *ip)
 
     if (connected) {
         char buf[36];
-        snprintf(buf, sizeof(buf), "WiFi: ON %s",
-                 (ip && ip[0]) ? ip : "---");
+        snprintf(buf, sizeof(buf), "WiFi: ON %s",(ip && ip[0]) ? ip : "---");
         lv_label_set_text(label_wifi, buf);
-        lv_obj_set_style_text_color(label_wifi,
-                                    lv_color_hex(COR_VERDE), 0);
+        lv_obj_set_style_text_color(label_wifi,lv_color_hex(COR_VERDE), 0);
     } else {
         lv_label_set_text(label_wifi, "WiFi: OFF");
-        lv_obj_set_style_text_color(label_wifi,
-                                    lv_color_hex(COR_VERMELHO), 0);
+        lv_obj_set_style_text_color(label_wifi,lv_color_hex(COR_VERMELHO), 0);
     }
 }
 
