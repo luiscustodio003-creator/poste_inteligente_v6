@@ -3,27 +3,39 @@
    ------------------------------------------------------------
    @file      udp_manager.c
    @brief     Comunicação UDP entre postes — protocolo completo
-   @version   3.2
-   @date      2026-03-20
+   @version   3.3
+   @date      2026-03-25
 
    Projecto  : Poste Inteligente
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
 
-   Alterações v3.1 → v3.2:
+   Alterações v3.2 → v3.3:
    ------------------------
+   CORRECÇÃO 4: SO_RCVTIMEO reduzido de 100ms para 10ms.
+                vTaskDelay reduzido de 100ms para 10ms.
+
+                Problema: o poste A envia TC_INC seguido de SPD
+                em sequência imediata. Com timeout de 100ms, o
+                poste B processava TC_INC na iteração t=0 e SPD
+                na iteração t=100ms (próximo recvfrom). Isto
+                atrasava o cálculo do timer de pré-acendimento
+                (s_acender_em_ms) em até 100ms.
+
+                Solução: com SO_RCVTIMEO=10ms e vTaskDelay=10ms,
+                TC_INC e SPD chegam em iterações separadas por
+                no máximo 10ms — negligenciável para o ETA
+                (que é da ordem dos 1000-4000ms).
+
+                Impacto: ciclo da task passa de 100ms para ~10ms.
+                Consumo CPU adicional: irrelevante no ESP32 @240MHz
+                dado que recvfrom bloqueia aguardando pacotes.
+
+   Alterações v3.1 → v3.2 (mantidas):
+   ------------------------------------
    CORRECÇÃO 1: STATUS recebido cria vizinho se não existir.
-                Antes: ignorava STATUS de vizinhos desconhecidos.
-                Agora: STATUS serve também como registo inicial,
-                       usando o IP de origem e o ID do pacote.
-
-   CORRECÇÃO 2: DISCOVER enviado imediatamente no arranque
-                (s_ultimo_disc = 0 - DISCOVER_INTERVAL_MS).
-                Antes: esperava DISCOVER_INTERVAL_MS antes do
-                primeiro broadcast, causando janela cega.
-
-   CORRECÇÃO 3: udp_manager_get_neighbors() usa position para
-                determinar esq/dir (coerente com comm_manager).
+   CORRECÇÃO 2: DISCOVER enviado imediatamente no arranque.
+   CORRECÇÃO 3: udp_manager_get_neighbors() usa position.
 
 ============================================================ */
 
@@ -359,7 +371,8 @@ static void udp_task(void *arg)
 
         _verificar_timeouts(agora);
 
-        vTaskDelay(pdMS_TO_TICKS(100));
+        /* CORRECÇÃO v3.3: 10ms — consistente com SO_RCVTIMEO */
+        vTaskDelay(pdMS_TO_TICKS(10));
     }
 }
 
@@ -388,7 +401,10 @@ bool udp_manager_init(void)
     setsockopt(s_socket, SOL_SOCKET, SO_BROADCAST,
                &bc, sizeof(bc));
 
-    struct timeval tv = { .tv_sec = 0, .tv_usec = 100000 };
+    /* CORRECÇÃO v3.3: 10ms em vez de 100ms — garante que TC_INC
+       e SPD enviados em sequência são processados com diferença
+       máxima de 10ms, sem atrasar o timer de pré-acendimento. */
+    struct timeval tv = { .tv_sec = 0, .tv_usec = 10000 };
     setsockopt(s_socket, SOL_SOCKET, SO_RCVTIMEO,
                &tv, sizeof(tv));
 
@@ -412,7 +428,7 @@ bool udp_manager_init(void)
     xTaskCreate(udp_task, "udp_task", 4096, NULL, 5, NULL);
 
     s_iniciado = true;
-    ESP_LOGI(TAG, "UDP Manager v3.2 pronto (porto %d)", UDP_PORT);
+    ESP_LOGI(TAG, "UDP Manager v3.3 pronto (porto %d)", UDP_PORT);
     return true;
 }
 

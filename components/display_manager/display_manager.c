@@ -1,9 +1,9 @@
 /* ============================================================
-   DISPLAY MANAGER — IMPLEMENTAÇÃO v5.2
+   DISPLAY MANAGER — IMPLEMENTAÇÃO v5.3
    ------------------------------------------------------------
    @file      display_manager.c
    @brief     Camada de apresentação LVGL + ST7789 — ecrã 240×240
-   @version   5.2
+   @version   5.3
    @date      2026-03-25
 
    Projecto  : Poste Inteligente
@@ -15,7 +15,7 @@
    Layout final aprovado com radar em tempo real via lv_canvas
    e visualização HLK-LD2450 com sweep animado, halos e rastos.
 
-   Layout do ecrã v5.2 (alturas em pixels):
+   Layout do ecrã v5.3 (alturas em pixels):
    ------------------------------------------
      y=  0.. 35  → ZONA IDENTIDADE   (subtítulo + nome NVS + badge FSM)
      y= 36.. 36  → separador
@@ -25,18 +25,42 @@
      y=146..146  → separador
      y=147..239  → ZONA RADAR        (lv_canvas 230×90 px, HLK-LD2450 X/Y)
 
-   Alterações v5.0 → v5.2:
-   ------------------------
-   CORRECÇÃO 1: COR_VERDE era 0xC00028 (vermelho) → corrigido para 0x22C55E
-   CORRECÇÃO 2: COR_VERMELHO era 0x001840 (azul) → corrigido para 0xFF3333
-   CORRECÇÃO 3: RADAR_XSPAN_MM adicionado a system_config.h via define local
-                (era referenciado sem estar definido → erro de compilação)
-   CORRECÇÃO 4: radar_obj_t vem de radar_manager.h (v2.1) via display_manager.h
-                — sem redefinição local do tipo
-   MELHORIA 1:  Paleta de cores revista para melhor contraste no ST7789
-   MELHORIA 2:  Sweep radar mais suave (sector de fade aumentado para 35 graus)
-   MELHORIA 3:  Cards de tráfego com borda colorida activa quando valor > 0
-   MELHORIA 4:  Badge FSM com cantos arredondados e padding consistente
+   CORRECÇÃO CRÍTICA v5.2 → v5.3 — THREAD SAFETY (Task Watchdog):
+   -----------------------------------------------------------------
+   Problema: o LVGL não é thread-safe. As funções set_*() eram
+   chamadas directamente por fsm_task e main_task, enquanto
+   lv_timer_handler() corria também na main_task. Isto causava
+   acesso concorrente ao heap do LVGL (lv_tlsf_malloc /
+   lv_tlsf_free) e disparava o Task Watchdog por bloqueio de CPU.
+
+   Backtrace típico do problema:
+     lv_label_set_text → lv_mem_alloc → lv_tlsf_malloc (bloqueio)
+     lv_label_set_text → lv_mem_free  → lv_tlsf_free   (bloqueio)
+
+   Solução — padrão de fila de mensagens (Message Queue):
+     1. Todas as funções set_*() são agora NON-BLOCKING:
+        apenas empacotam os dados numa struct dm_msg_t
+        e fazem xQueueSend() para s_fila (capacidade 16).
+        Nunca tocam no LVGL directamente.
+
+     2. display_manager_task() — chamada exclusivamente pela
+        main_task — drena a fila com xQueueReceive(0) e aplica
+        cada mensagem ao LVGL, depois chama lv_timer_handler().
+        É a ÚNICA função que toca em objectos LVGL.
+
+     3. display_manager_tick() continua a chamar lv_tick_inc()
+        — esta é thread-safe por ser apenas um incremento atómico.
+
+   Resultado: todo o LVGL corre numa única task (main_task),
+   eliminando a concorrência e o watchdog.
+
+   Alterações v5.0 → v5.2 (mantidas):
+   -------------------------------------
+   CORRECÇÃO 1: COR_VERDE corrigido para 0x22C55E
+   CORRECÇÃO 2: COR_VERMELHO corrigido para 0xFF3333
+   CORRECÇÃO 3: RADAR_XSPAN_MM definido localmente
+   CORRECÇÃO 4: radar_obj_t vem de radar_manager.h
+   MELHORIA 1-4: paleta, sweep, bordas, badge
 
    Dependências:
    -------------
@@ -59,11 +83,63 @@
 #include <stdio.h>
 #include <math.h>
 #include <lvgl.h>
+#include "freertos/FreeRTOS.h"
+#include "freertos/queue.h"
 
 /* ============================================================
    ETIQUETA DE LOG
 ============================================================ */
 static const char *TAG = "DISP_MGR";
+
+/* ============================================================
+   FILA DE MENSAGENS — THREAD SAFETY
+   ------------------------------------------------------------
+   Todas as funções set_*() enviam mensagens para esta fila.
+   display_manager_task() drena a fila e aplica ao LVGL.
+   Capacidade: 16 mensagens — suficiente para um ciclo FSM
+   (máximo ~8 chamadas set_* por iteração de 100ms).
+============================================================ */
+#define DM_FILA_CAP  16
+
+/* Tipos de mensagem — identificam qual campo actualizar */
+typedef enum {
+    DM_MSG_STATUS = 0,
+    DM_MSG_WIFI,
+    DM_MSG_HARDWARE,
+    DM_MSG_TRAFFIC,
+    DM_MSG_SPEED,
+    DM_MSG_NEIGHBORS,
+    DM_MSG_RADAR,
+} dm_msg_tipo_t;
+
+/* Payload máximo por mensagem — union para não desperdiçar RAM */
+typedef struct {
+    dm_msg_tipo_t tipo;
+    union {
+        /* DM_MSG_STATUS */
+        struct { char status[16]; } st;
+        /* DM_MSG_WIFI */
+        struct { bool connected; char ip[16]; } wifi;
+        /* DM_MSG_HARDWARE */
+        struct { bool radar_ok; uint8_t brightness; } hw;
+        /* DM_MSG_TRAFFIC */
+        struct { int T; int Tc; } traf;
+        /* DM_MSG_SPEED */
+        struct { int speed; } spd;
+        /* DM_MSG_NEIGHBORS */
+        struct {
+            char nebL[16]; char nebR[16];
+            bool leftOk;   bool rightOk;
+        } neb;
+        /* DM_MSG_RADAR */
+        struct {
+            radar_obj_t objs[RADAR_MAX_OBJ];
+            uint8_t     count;
+        } radar;
+    };
+} dm_msg_t;
+
+static QueueHandle_t s_fila = NULL;
 
 /* ============================================================
    CONSTANTE EM FALTA — RADAR_XSPAN_MM
@@ -698,64 +774,195 @@ void display_manager_init(void)
     memset(s_radar_objs, 0, sizeof(s_radar_objs));
     s_radar_count = 0;
 
+    /* Cria fila de mensagens thread-safe (v5.3) */
+    s_fila = xQueueCreate(DM_FILA_CAP, sizeof(dm_msg_t));
+    if (!s_fila)
+        ESP_LOGE(TAG, "Falha ao criar fila de mensagens!");
+
     ui_create();
 
-    ESP_LOGI(TAG, "Display v5.2 pronto");
+    ESP_LOGI(TAG, "Display v5.3 pronto (thread-safe via fila)");
 }
 
 void display_manager_tick(uint32_t ms)
 {
+    /* lv_tick_inc é thread-safe (apenas incremento atómico) */
     lv_tick_inc(ms);
 }
 
+/* ------------------------------------------------------------
+   display_manager_task
+   ------------------------------------------------------------
+   ÚNICA função que toca em objectos LVGL.
+   Chamar exclusivamente da main_task.
+
+   Por ciclo:
+     1. Drena toda a fila de mensagens e aplica ao LVGL
+     2. Chama lv_timer_handler() para renderizar/flush
+   
+   Como s_fila usa xQueueReceive com timeout=0 (não bloqueante),
+   esta função retorna imediatamente se não houver mensagens,
+   garantindo que lv_timer_handler() corre sempre.
+------------------------------------------------------------ */
 void display_manager_task(void)
 {
+    if (!s_fila) { lv_timer_handler(); return; }
+
+    /* Drena fila completa — processa TODAS as mensagens pendentes */
+    dm_msg_t msg;
+    while (xQueueReceive(s_fila, &msg, 0) == pdTRUE)
+    {
+        switch (msg.tipo)
+        {
+            /* ---- STATUS ---- */
+            case DM_MSG_STATUS:
+                if (!label_badge) break;
+                lv_label_set_text(label_badge, msg.st.status);
+                {
+                    uint32_t cor_txt = COR_CINZENTO;
+                    uint32_t cor_bg  = 0x1C1C1C;
+                    uint32_t cor_brd = COR_SEPARADOR;
+                    const char *s = msg.st.status;
+                    if      (strcmp(s, "LIGHT ON")  == 0) { cor_txt = COR_AMARELO;  cor_bg = 0x1E1600; cor_brd = 0x3A2A00; }
+                    else if (strcmp(s, "SAFE MODE") == 0) { cor_txt = COR_LARANJA;  cor_bg = 0x1E0E00; cor_brd = 0x3A1A00; }
+                    else if (strcmp(s, "MASTER")    == 0) { cor_txt = COR_VERDE;    cor_bg = 0x001A08; cor_brd = 0x003A10; }
+                    else if (strcmp(s, "AUTONOMO")  == 0) { cor_txt = COR_VERMELHO; cor_bg = 0x1A0000; cor_brd = 0x3A0000; }
+                    lv_obj_set_style_text_color(label_badge,  lv_color_hex(cor_txt), 0);
+                    lv_obj_set_style_bg_color(label_badge,    lv_color_hex(cor_bg),  0);
+                    lv_obj_set_style_border_color(label_badge,lv_color_hex(cor_brd), 0);
+                }
+                break;
+
+            /* ---- WIFI ---- */
+            case DM_MSG_WIFI:
+                if (!label_wifi) break;
+                if (msg.wifi.connected) {
+                    char buf[36];
+                    snprintf(buf, sizeof(buf), "WiFi: ON  %s",
+                             msg.wifi.ip[0] ? msg.wifi.ip : "---");
+                    lv_label_set_text(label_wifi, buf);
+                    lv_obj_set_style_text_color(label_wifi, lv_color_hex(COR_VERDE), 0);
+                } else {
+                    lv_label_set_text(label_wifi, "WiFi: OFF");
+                    lv_obj_set_style_text_color(label_wifi, lv_color_hex(COR_VERMELHO), 0);
+                }
+                break;
+
+            /* ---- HARDWARE ---- */
+            case DM_MSG_HARDWARE:
+                if (label_radar_st) {
+                    lv_label_set_text(label_radar_st,
+                        msg.hw.radar_ok ? "Radar: OK" : "Radar: ERR");
+                    lv_obj_set_style_text_color(label_radar_st,
+                        lv_color_hex(msg.hw.radar_ok ? COR_VERDE : COR_VERMELHO), 0);
+                }
+                if (label_dali) {
+                    char buf[14];
+                    snprintf(buf, sizeof(buf), "DALI: %3d%%", msg.hw.brightness);
+                    lv_label_set_text(label_dali, buf);
+                    lv_obj_set_style_text_color(label_dali,
+                        lv_color_hex(msg.hw.brightness > LIGHT_MIN ? COR_AMARELO : COR_CINZENTO), 0);
+                }
+                if (bar_dali)
+                    lv_bar_set_value(bar_dali, (int)msg.hw.brightness, LV_ANIM_ON);
+                break;
+
+            /* ---- TRÁFEGO ---- */
+            case DM_MSG_TRAFFIC:
+                if (label_T_val) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "%d", msg.traf.T);
+                    lv_label_set_text(label_T_val, buf);
+                    lv_obj_set_style_text_color(label_T_val,
+                        lv_color_hex(msg.traf.T > 0 ? COR_AMARELO : COR_CINZENTO), 0);
+                    if (card_T)
+                        lv_obj_set_style_border_color(card_T,
+                            lv_color_hex(msg.traf.T > 0 ? COR_AMARELO : COR_SEPARADOR), 0);
+                }
+                if (label_Tc_val) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "%d", msg.traf.Tc);
+                    lv_label_set_text(label_Tc_val, buf);
+                    lv_obj_set_style_text_color(label_Tc_val,
+                        lv_color_hex(msg.traf.Tc > 0 ? COR_CIANO : COR_CINZENTO), 0);
+                    if (card_Tc)
+                        lv_obj_set_style_border_color(card_Tc,
+                            lv_color_hex(msg.traf.Tc > 0 ? COR_CIANO : COR_SEPARADOR), 0);
+                }
+                break;
+
+            /* ---- VELOCIDADE ---- */
+            case DM_MSG_SPEED:
+                if (label_vel_val) {
+                    char buf[8];
+                    snprintf(buf, sizeof(buf), "%d", msg.spd.speed);
+                    lv_label_set_text(label_vel_val, buf);
+                    lv_obj_set_style_text_color(label_vel_val,
+                        lv_color_hex(msg.spd.speed > 0 ? COR_VIOLETA : COR_CINZENTO), 0);
+                    if (card_vel)
+                        lv_obj_set_style_border_color(card_vel,
+                            lv_color_hex(msg.spd.speed > 0 ? COR_VIOLETA : COR_SEPARADOR), 0);
+                }
+                break;
+
+            /* ---- VIZINHOS ---- */
+            case DM_MSG_NEIGHBORS:
+                if (label_neb_esq) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "E:%s %s",
+                             msg.neb.nebL[0] ? msg.neb.nebL : "---",
+                             msg.neb.leftOk ? "OK" : "OFF");
+                    lv_label_set_text(label_neb_esq, buf);
+                    lv_obj_set_style_text_color(label_neb_esq,
+                        lv_color_hex(msg.neb.leftOk ? COR_VERDE : COR_VERMELHO), 0);
+                }
+                if (label_neb_dir) {
+                    char buf[32];
+                    snprintf(buf, sizeof(buf), "D:%s %s",
+                             msg.neb.nebR[0] ? msg.neb.nebR : "---",
+                             msg.neb.rightOk ? "OK" : "OFF");
+                    lv_label_set_text(label_neb_dir, buf);
+                    lv_obj_set_style_text_color(label_neb_dir,
+                        lv_color_hex(msg.neb.rightOk ? COR_VERDE : COR_VERMELHO), 0);
+                }
+                break;
+
+            /* ---- RADAR ---- */
+            case DM_MSG_RADAR:
+                s_radar_count = msg.radar.count;
+                if (msg.radar.count > 0)
+                    memcpy(s_radar_objs, msg.radar.objs,
+                           msg.radar.count * sizeof(radar_obj_t));
+                else
+                    memset(s_radar_objs, 0, sizeof(s_radar_objs));
+                _radar_redraw();
+                break;
+
+            default:
+                break;
+        }
+    }
+
+    /* Renderiza LVGL — sempre, mesmo que não haja mensagens */
     lv_timer_handler();
 }
 
 
 /* ============================================================
    API PÚBLICA — ACTUALIZAÇÃO DE ESTADO
+   ------------------------------------------------------------
+   TODAS as funções abaixo são NON-BLOCKING e THREAD-SAFE.
+   Apenas empacotam os dados numa dm_msg_t e fazem xQueueSend().
+   Nunca tocam em objectos LVGL directamente.
+   O LVGL só é acedido em display_manager_task() (main_task).
 ============================================================ */
 
-/* ------------------------------------------------------------
-   display_manager_set_status
-   Mapeamento de estados para cores:
-     IDLE      → cinzento   (sem actividade)
-     LIGHT ON  → amarelo    (luz activa)
-     SAFE MODE → laranja    (radar falhou)
-     MASTER    → verde      (poste líder)
-     AUTONOMO  → vermelho   (sem rede)
------------------------------------------------------------- */
 void display_manager_set_status(const char *status)
 {
-    if (!label_badge || !status) return;
-
-    lv_label_set_text(label_badge, status);
-
-    uint32_t cor_txt = COR_CINZENTO;
-    uint32_t cor_bg  = 0x1C1C1C;
-    uint32_t cor_brd = COR_SEPARADOR;
-
-    if      (strcmp(status, "LIGHT ON")  == 0) {
-        cor_txt = COR_AMARELO;  cor_bg = 0x1E1600; cor_brd = 0x3A2A00;
-    }
-    else if (strcmp(status, "SAFE MODE") == 0) {
-        cor_txt = COR_LARANJA;  cor_bg = 0x1E0E00; cor_brd = 0x3A1A00;
-    }
-    else if (strcmp(status, "MASTER")    == 0) {
-        cor_txt = COR_VERDE;    cor_bg = 0x001A08; cor_brd = 0x003A10;
-    }
-    else if (strcmp(status, "AUTONOMO")  == 0) {
-        cor_txt = COR_VERMELHO; cor_bg = 0x1A0000; cor_brd = 0x3A0000;
-    }
-
-    lv_obj_set_style_text_color(label_badge,
-                                lv_color_hex(cor_txt), 0);
-    lv_obj_set_style_bg_color(label_badge,
-                              lv_color_hex(cor_bg), 0);
-    lv_obj_set_style_border_color(label_badge,
-                                  lv_color_hex(cor_brd), 0);
+    if (!s_fila || !status) return;
+    dm_msg_t msg = { .tipo = DM_MSG_STATUS };
+    strncpy(msg.st.status, status, sizeof(msg.st.status) - 1);
+    xQueueSend(s_fila, &msg, 0);
 }
 
 void display_manager_set_leader(bool is_leader)
@@ -765,99 +972,40 @@ void display_manager_set_leader(bool is_leader)
 
 void display_manager_set_wifi(bool connected, const char *ip)
 {
-    if (!label_wifi) return;
-
-    if (connected) {
-        char buf[36];
-        snprintf(buf, sizeof(buf), "WiFi: ON  %s",
-                 (ip && ip[0]) ? ip : "---");
-        lv_label_set_text(label_wifi, buf);
-        lv_obj_set_style_text_color(label_wifi,
-                                    lv_color_hex(COR_VERDE), 0);
-    } else {
-        lv_label_set_text(label_wifi, "WiFi: OFF");
-        lv_obj_set_style_text_color(label_wifi,
-                                    lv_color_hex(COR_VERMELHO), 0);
-    }
+    if (!s_fila) return;
+    dm_msg_t msg = { .tipo = DM_MSG_WIFI };
+    msg.wifi.connected = connected;
+    if (ip && ip[0])
+        strncpy(msg.wifi.ip, ip, sizeof(msg.wifi.ip) - 1);
+    else
+        msg.wifi.ip[0] = '\0';
+    xQueueSend(s_fila, &msg, 0);
 }
 
 void display_manager_set_hardware(bool radar_ok, uint8_t brightness)
 {
-    if (label_radar_st) {
-        lv_label_set_text(label_radar_st,
-                          radar_ok ? "Radar: OK" : "Radar: ERR");
-        lv_obj_set_style_text_color(label_radar_st,
-                                    lv_color_hex(radar_ok
-                                        ? COR_VERDE
-                                        : COR_VERMELHO), 0);
-    }
-
-    if (label_dali) {
-        char buf[14];
-        snprintf(buf, sizeof(buf), "DALI: %3d%%", brightness);
-        lv_label_set_text(label_dali, buf);
-        lv_obj_set_style_text_color(label_dali,
-                                    lv_color_hex(brightness > LIGHT_MIN
-                                        ? COR_AMARELO
-                                        : COR_CINZENTO), 0);
-    }
-
-    if (bar_dali)
-        lv_bar_set_value(bar_dali, (int)brightness, LV_ANIM_ON);
+    if (!s_fila) return;
+    dm_msg_t msg = { .tipo = DM_MSG_HARDWARE };
+    msg.hw.radar_ok   = radar_ok;
+    msg.hw.brightness = brightness;
+    xQueueSend(s_fila, &msg, 0);
 }
 
-/* ------------------------------------------------------------
-   display_manager_set_traffic
-   MELHORIA v5.2: borda do card activa quando valor > 0
------------------------------------------------------------- */
 void display_manager_set_traffic(int T, int Tc)
 {
-    if (label_T_val) {
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%d", T);
-        lv_label_set_text(label_T_val, buf);
-        lv_obj_set_style_text_color(label_T_val,
-                                    lv_color_hex(T > 0
-                                        ? COR_AMARELO
-                                        : COR_CINZENTO), 0);
-        /* Borda colorida quando activo */
-        if (card_T) {
-            lv_obj_set_style_border_color(card_T,
-                lv_color_hex(T > 0 ? COR_AMARELO : COR_SEPARADOR), 0);
-            lv_obj_set_style_border_width(card_T, T > 0 ? 1 : 1, 0);
-        }
-    }
-
-    if (label_Tc_val) {
-        char buf[8];
-        snprintf(buf, sizeof(buf), "%d", Tc);
-        lv_label_set_text(label_Tc_val, buf);
-        lv_obj_set_style_text_color(label_Tc_val,
-                                    lv_color_hex(Tc > 0
-                                        ? COR_CIANO
-                                        : COR_CINZENTO), 0);
-        if (card_Tc) {
-            lv_obj_set_style_border_color(card_Tc,
-                lv_color_hex(Tc > 0 ? COR_CIANO : COR_SEPARADOR), 0);
-        }
-    }
+    if (!s_fila) return;
+    dm_msg_t msg = { .tipo = DM_MSG_TRAFFIC };
+    msg.traf.T  = T;
+    msg.traf.Tc = Tc;
+    xQueueSend(s_fila, &msg, 0);
 }
 
 void display_manager_set_speed(int speed)
 {
-    if (!label_vel_val) return;
-
-    char buf[8];
-    snprintf(buf, sizeof(buf), "%d", speed);
-    lv_label_set_text(label_vel_val, buf);
-    lv_obj_set_style_text_color(label_vel_val,
-                                lv_color_hex(speed > 0
-                                    ? COR_VIOLETA
-                                    : COR_CINZENTO), 0);
-    if (card_vel) {
-        lv_obj_set_style_border_color(card_vel,
-            lv_color_hex(speed > 0 ? COR_VIOLETA : COR_SEPARADOR), 0);
-    }
+    if (!s_fila) return;
+    dm_msg_t msg = { .tipo = DM_MSG_SPEED };
+    msg.spd.speed = speed;
+    xQueueSend(s_fila, &msg, 0);
 }
 
 void display_manager_set_neighbors(const char *nebL,
@@ -865,51 +1013,29 @@ void display_manager_set_neighbors(const char *nebL,
                                    bool        leftOk,
                                    bool        rightOk)
 {
-    if (label_neb_esq) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "E:%s %s",
-                 (nebL && nebL[0]) ? nebL : "---",
-                 leftOk ? "OK" : "OFF");
-        lv_label_set_text(label_neb_esq, buf);
-        lv_obj_set_style_text_color(label_neb_esq,
-                                    lv_color_hex(leftOk
-                                        ? COR_VERDE
-                                        : COR_VERMELHO), 0);
-    }
-
-    if (label_neb_dir) {
-        char buf[32];
-        snprintf(buf, sizeof(buf), "D:%s %s",
-                 (nebR && nebR[0]) ? nebR : "---",
-                 rightOk ? "OK" : "OFF");
-        lv_label_set_text(label_neb_dir, buf);
-        lv_obj_set_style_text_color(label_neb_dir,
-                                    lv_color_hex(rightOk
-                                        ? COR_VERDE
-                                        : COR_VERMELHO), 0);
-    }
+    if (!s_fila) return;
+    dm_msg_t msg = { .tipo = DM_MSG_NEIGHBORS };
+    if (nebL && nebL[0])
+        strncpy(msg.neb.nebL, nebL, sizeof(msg.neb.nebL) - 1);
+    else
+        msg.neb.nebL[0] = '\0';
+    if (nebR && nebR[0])
+        strncpy(msg.neb.nebR, nebR, sizeof(msg.neb.nebR) - 1);
+    else
+        msg.neb.nebR[0] = '\0';
+    msg.neb.leftOk  = leftOk;
+    msg.neb.rightOk = rightOk;
+    xQueueSend(s_fila, &msg, 0);
 }
 
-/* ------------------------------------------------------------
-   display_manager_set_radar
-   Actualiza objectos detectados e redesenha canvas.
-   @param objs  Array radar_obj_t com X/Y em mm e rasto.
-   @param count Número de objectos (0..RADAR_MAX_OBJ).
------------------------------------------------------------- */
 void display_manager_set_radar(const radar_obj_t *objs,
                                uint8_t            count)
 {
-    if (!canvas_radar) return;
-
-    s_radar_count = (count > RADAR_MAX_OBJ) ? RADAR_MAX_OBJ : count;
-
-    if (objs && s_radar_count > 0) {
-        memcpy(s_radar_objs, objs,
-               s_radar_count * sizeof(radar_obj_t));
-    } else {
-        memset(s_radar_objs, 0, sizeof(s_radar_objs));
-        s_radar_count = 0;
-    }
-
-    _radar_redraw();
+    if (!s_fila) return;
+    dm_msg_t msg = { .tipo = DM_MSG_RADAR };
+    msg.radar.count = (count > RADAR_MAX_OBJ) ? RADAR_MAX_OBJ : count;
+    if (objs && msg.radar.count > 0)
+        memcpy(msg.radar.objs, objs,
+               msg.radar.count * sizeof(radar_obj_t));
+    xQueueSend(s_fila, &msg, 0);
 }
