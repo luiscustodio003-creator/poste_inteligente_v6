@@ -3,7 +3,7 @@
    ------------------------------------------------------------
    @file      post_config.c
    @brief     Gestão da configuração persistente do poste na NVS
-   @version   2.1
+   @version   2.2
    @date      2026-03-19
 
    Projecto  : Poste Inteligente
@@ -97,59 +97,28 @@ void post_config_init(void)
     /* Limpa estrutura interna */
     memset(&s_post, 0, sizeof(s_post));
 
-    nvs_handle_t handle;
-    bool primeiro_arranque = false;
+    /* system_config.h e SEMPRE a fonte de verdade.
+       Em cada arranque os valores sao escritos na NVS,
+       garantindo que alteracoes ao config se reflectem
+       imediatamente sem necessidade de erase-flash.     */
+    s_post.id = (uint8_t)POSTE_ID;
+    strncpy(s_post.name, POSTE_NAME, sizeof(s_post.name) - 1);
+    s_post.name[sizeof(s_post.name) - 1] = '\0';
 
+    nvs_handle_t handle;
     if (nvs_open(NVS_NAMESPACE, NVS_READWRITE, &handle) == ESP_OK)
     {
-        /* --- Carregar ID --- */
-        uint32_t id = (uint32_t)POSTE_ID;   /* valor por omissão */
-        nvs_get_u32(handle, "post_id", &id);
-        s_post.id = (uint8_t)id;
-
-        /* --- Carregar nome ---
-           nvs_get_str exige que name_len contenha o tamanho máximo
-           do buffer (incluindo terminador) antes da chamada.        */
-        size_t name_len = sizeof(s_post.name);
-        esp_err_t err = nvs_get_str(handle, "post_name",
-                                    s_post.name, &name_len);
-
-        if (err != ESP_OK)
-        {
-            /* Primeiro arranque — popula NVS com valores de system_config.h */
-            primeiro_arranque = true;
-            strncpy(s_post.name, POSTE_NAME, sizeof(s_post.name) - 1);
-            s_post.name[sizeof(s_post.name) - 1] = '\0';
-
-            nvs_set_str(handle, "post_name", s_post.name);
-            nvs_set_u32(handle, "post_id",   (uint32_t)POSTE_ID);
-            nvs_commit(handle);
-
-            ESP_LOGI(TAG, "Primeiro arranque | NVS populada | ID=%d NAME=%s",
-                     POSTE_ID, POSTE_NAME);
-        }
-
+        nvs_set_u32(handle, "post_id",   (uint32_t)s_post.id);
+        nvs_set_str(handle, "post_name", s_post.name);
+        nvs_commit(handle);
         nvs_close(handle);
-
-        if (primeiro_arranque)
-        {
-            ESP_LOGI(TAG, "Defaults aplicados | ID=%d | NAME=%s",
-                     s_post.id, s_post.name);
-        }
-        else
-        {
-            ESP_LOGI(TAG, "Config carregada da NVS | ID=%d | NAME=%s",
-                     s_post.id, s_post.name);
-        }
+        ESP_LOGI(TAG, "Config aplicada | ID=%d | NAME=%s",
+                 s_post.id, s_post.name);
     }
     else
     {
-        /* NVS não acessível — usa valores de system_config.h apenas em RAM */
-        s_post.id = (uint8_t)POSTE_ID;
-        strncpy(s_post.name, POSTE_NAME, sizeof(s_post.name) - 1);
-        s_post.name[sizeof(s_post.name) - 1] = '\0';
-
-        ESP_LOGW(TAG, "NVS não acessível | usando valores de system_config.h");
+        ESP_LOGW(TAG, "NVS nao acessivel | ID=%d | NAME=%s (so RAM)",
+                 s_post.id, s_post.name);
     }
 }
 

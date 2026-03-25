@@ -3,8 +3,8 @@
    ------------------------------------------------------------
    @file      state_machine.h
    @brief     Máquina de estados do Poste Inteligente
-   @version   2.0
-   @date      2026-03-20
+   @version   2.4
+   @date      2026-03-25
 
    Projecto  : Poste Inteligente
    Estudantes: Luis Custodio | Tiago Moreno
@@ -44,10 +44,17 @@
    Callbacks UDP (implementados aqui, declarados como weak
    no udp_manager):
    ---------------------------------------------------------
-     on_tc_inc_received()     → Tc++, acende 100%
+     on_tc_inc_received()     → Tc++, acende 100%, propaga em cadeia
      on_prev_passed_received()→ T--
-     on_spd_received()        → guarda velocidade (informativo)
+     on_spd_received()        → guarda velocidade, refina timeout Tc com ETA
      on_master_claim_received()→ cede liderança
+
+   Alterações v2.0 → v2.3:
+   ------------------------
+   1. on_tc_inc_received() propaga TC_INC ao vizinho direito
+   2. on_spd_received() usa ETA para refinar timeout Tc
+   3. Timeout Tc (TC_TIMEOUT_MS) adicionado — evita Tc preso
+   4. MASTER preservado em _aplicar_brilho e sm_on_radar_detect
 
    Dependências:
    -------------
@@ -119,13 +126,18 @@ void sm_on_right_neighbor_online(void);
    CALLBACKS UDP (implementações reais dos weak do udp_manager)
 ============================================================ */
 
-/** Recebeu TC_INC com vel>0 — carro a caminho: Tc++ */
+/** Recebeu TC_INC com vel>0 — carro a caminho.
+ *  Tc++, acende 100%, inicia timeout segurança,
+ *  propaga TC_INC ao vizinho direito em cadeia (A→B→C→D...).
+ */
 void on_tc_inc_received(float speed);
 
 /** Recebeu TC_INC com vel<0 — carro passou: T-- */
 void on_prev_passed_received(void);
 
-/** Recebeu SPD — informativo, guarda velocidade */
+/** Recebeu SPD — guarda velocidade e refina timeout Tc com ETA real.
+ *  Se eta_ms>0 e Tc>0, ajusta s_tc_timeout_ms = agora + eta_ms*2.
+ */
 void on_spd_received(float speed, uint32_t eta_ms);
 
 /** Recebeu MASTER_CLAIM — cede liderança e propaga */
@@ -164,5 +176,18 @@ float state_machine_get_last_speed(void);
 
 /** true se radar local está operacional */
 bool state_machine_radar_ok(void);
+
+/* ============================================================
+   SIMULADOR — apenas USE_RADAR=0
+============================================================ */
+
+/**
+ * @brief Lê posição actual do carro simulado para o canvas.
+ *        Chamada pelo main.c a cada ciclo de 100ms.
+ * @param x_mm  Posição lateral em mm (pode ser NULL)
+ * @param y_mm  Distância frontal em mm (pode ser NULL)
+ * @return true se carro está visível no canvas
+ */
+bool sim_get_objeto(float *x_mm, float *y_mm);
 
 #endif /* STATE_MACHINE_H */

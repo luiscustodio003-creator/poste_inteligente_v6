@@ -3,7 +3,9 @@
    ------------------------------------------------------------
    @file      state_machine.c
    @brief     Máquina de estados do Poste Inteligente
-   
+   @version   2.4
+   @date      2026-03-25
+
    Projecto  : Poste Inteligente
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
@@ -56,6 +58,11 @@ static const char *TAG = "FSM";
 #define T_STUCK_TIMEOUT_MS  (TRAFIC_TIMEOUT_MS * 3)
 #endif
 
+/* Timeout seguranca Tc — UDP perdido / carro nao chegou */
+#ifndef TC_TIMEOUT_MS
+#define TC_TIMEOUT_MS  (TRAFIC_TIMEOUT_MS * 2)
+#endif
+
 /* ============================================================
    NÚMERO DE LEITURAS CONSECUTIVAS SEM DETECÇÃO
    para confirmar falha do radar (evita falsos positivos).
@@ -76,7 +83,8 @@ static bool           s_right_online   = true;
 
 /* Timestamps para timeouts */
 static uint64_t s_last_detect_ms       = 0;
-static uint64_t s_left_offline_ms      = 0;  /* quando viz. esq. foi OFF */
+static uint64_t s_left_offline_ms      = 0;
+static uint64_t s_tc_timeout_ms        = 0;  /* timeout seguranca Tc */
 static bool     s_left_was_offline     = false;
 
 /* Contadores para detecção de falha do radar */
@@ -91,6 +99,110 @@ static uint64_t _agora_ms(void)
 {
     return (uint64_t)(esp_timer_get_time() / 1000ULL);
 }
+/* ============================================================
+   SIMULADOR FISICO — USE_RADAR=0
+   1 carro de cada vez, fisica real: vy = vel/3.6 * 100 mm/ciclo
+   Detecta quando y <= RADAR_DETECT_M*1000 mm
+   Ciclo: AGUARDA -> EM_VIA -> DETECTADO -> SAIU -> AGUARDA
+============================================================ */
+#if USE_RADAR == 0
+
+typedef enum {
+    SIM_AGUARDA  = 0,
+    SIM_EM_VIA,
+    SIM_DETECTADO,
+    SIM_SAIU,
+} sim_estado_t;
+
+typedef struct {
+    float        y_mm;
+    float        x_mm;
+    float        vy;
+    float        vel_kmh;
+    sim_estado_t estado;
+    uint64_t     t_inicio_ms;
+    bool         injectado;
+} sim_carro_t;
+
+static sim_carro_t s_sim_carro = {0};
+
+#define SIM_INTERVALO_MS  ((uint64_t)(TRAFIC_TIMEOUT_MS + 3000))
+#define SIM_ZONA_MM       ((float)(RADAR_DETECT_M * 1000))
+
+static const float s_sim_vels[] = { 30.0f, 50.0f, 80.0f, 50.0f };
+static int         s_sim_vel_idx = 0;
+
+static void _sim_iniciar(void)
+{
+    float vel = s_sim_vels[s_sim_vel_idx];
+    s_sim_vel_idx = (s_sim_vel_idx + 1) %
+        (sizeof(s_sim_vels) / sizeof(s_sim_vels[0]));
+    s_sim_carro.x_mm        = (float)((int32_t)(_agora_ms() & 0xFF) - 128) * 3.0f;
+    s_sim_carro.y_mm        = (float)RADAR_MAX_MM;
+    s_sim_carro.vel_kmh     = vel;
+    s_sim_carro.vy          = (vel / 3.6f) * 100.0f;
+    s_sim_carro.estado      = SIM_EM_VIA;
+    s_sim_carro.injectado   = false;
+    s_sim_carro.t_inicio_ms = _agora_ms();
+    ESP_LOGI("SIM", "Novo carro %.0fkm/h", vel);
+}
+
+static void _sim_update(void)
+{
+    uint64_t agora = _agora_ms();
+    switch (s_sim_carro.estado)
+    {
+        case SIM_AGUARDA:
+            if (s_sim_carro.t_inicio_ms == 0)
+                s_sim_carro.t_inicio_ms = agora;
+            if ((agora - s_sim_carro.t_inicio_ms) >= SIM_INTERVALO_MS)
+                _sim_iniciar();
+            break;
+        case SIM_EM_VIA:
+        case SIM_DETECTADO:
+            s_sim_carro.y_mm -= s_sim_carro.vy;
+            if (!s_sim_carro.injectado &&
+                s_sim_carro.y_mm <= SIM_ZONA_MM)
+            {
+                s_sim_carro.estado    = SIM_DETECTADO;
+                s_sim_carro.injectado = true;
+                ESP_LOGI("SIM", "Deteccao %.0fkm/h y=%.0fmm",
+                         s_sim_carro.vel_kmh, s_sim_carro.y_mm);
+                sm_on_radar_detect(s_sim_carro.vel_kmh);
+            }
+            if (s_sim_carro.y_mm <= 0.0f)
+            {
+                s_sim_carro.y_mm        = 0.0f;
+                s_sim_carro.estado      = SIM_SAIU;
+                s_sim_carro.t_inicio_ms = agora;
+                ESP_LOGI("SIM", "Carro saiu");
+            }
+            break;
+        case SIM_SAIU:
+            if (s_T == 0 && s_Tc == 0 &&
+                (agora - s_sim_carro.t_inicio_ms) >= (uint64_t)TRAFIC_TIMEOUT_MS)
+            {
+                s_sim_carro.estado      = SIM_AGUARDA;
+                s_sim_carro.t_inicio_ms = agora;
+            }
+            break;
+    }
+}
+
+bool sim_get_objeto(float *x_mm, float *y_mm)
+{
+    if (s_sim_carro.estado == SIM_EM_VIA ||
+        s_sim_carro.estado == SIM_DETECTADO)
+    {
+        if (x_mm) *x_mm = s_sim_carro.x_mm;
+        if (y_mm) *y_mm = s_sim_carro.y_mm;
+        return true;
+    }
+    return false;
+}
+
+#endif /* USE_RADAR == 0 */
+
 
 /* ============================================================
    _aplicar_brilho
@@ -104,7 +216,8 @@ static void _aplicar_brilho(void)
     {
         dali_set_brightness(LIGHT_MAX);
         if (s_state != STATE_SAFE_MODE &&
-            s_state != STATE_AUTONOMO)
+            s_state != STATE_AUTONOMO &&
+            s_state != STATE_MASTER)
             s_state = STATE_LIGHT_ON;
     }
     else
@@ -166,6 +279,7 @@ void state_machine_init(void)
     s_radar_ok_cnt     = 0;
     s_last_detect_ms   = 0;
     s_left_offline_ms  = 0;
+    s_tc_timeout_ms    = 0;
 
     dali_set_brightness(LIGHT_MIN);
     ESP_LOGI(TAG, "FSM v2.0 iniciada | IDLE | %d%%", LIGHT_MIN);
@@ -192,15 +306,12 @@ void sm_on_radar_detect(float vel)
 
     /* Converte Tc→T: carro era "a caminho", agora chegou */
     if (s_Tc > 0) s_Tc--;
-    /* T++ com limite superior — evita crescimento indefinido
-       por leituras duplicadas ou frames UART repetidos        */
     if (s_T < MAX_RADAR_TARGETS) s_T++;
 
-    /* Guarda timestamp da última detecção (usado pelo timeout de Tc) */
-    s_last_detect_ms = _agora_ms();
-    /* Acende imediatamente */
+    /* Acende — preserva MASTER */
     dali_set_brightness(LIGHT_MAX);
-    s_state = STATE_LIGHT_ON;
+    if (s_state != STATE_MASTER)
+        s_state = STATE_LIGHT_ON;
 
     ESP_LOGI(TAG, "Radar: %.1fkm/h | T=%d Tc=%d", vel, s_T, s_Tc);
 
@@ -262,18 +373,25 @@ void sm_on_right_neighbor_online(void)
    CALLBACKS UDP
 ============================================================ */
 
-/* Recebeu TC_INC com vel>0 — carro a caminho: Tc++ */
+/* Recebeu TC_INC com vel>0 — carro a caminho: Tc++
+   Propaga em cadeia ao viz. direito (A->B->C->D)     */
 void on_tc_inc_received(float speed)
 {
-    s_apagar_pend = false;
-    s_last_speed  = speed;
+    s_apagar_pend   = false;
+    s_last_speed    = speed;
     s_Tc++;
 
     dali_set_brightness(LIGHT_MAX);
-    s_state = STATE_LIGHT_ON;
+    if (s_state != STATE_MASTER)
+        s_state = STATE_LIGHT_ON;
+
+    s_tc_timeout_ms = _agora_ms() + TC_TIMEOUT_MS;
 
     ESP_LOGI(TAG, "TC_INC+: %.1fkm/h | T=%d Tc=%d",
              speed, s_T, s_Tc);
+
+    if (s_right_online)
+        comm_send_tc_inc(speed);
 }
 
 /* Recebeu TC_INC com vel<0 — carro passou: T-- */
@@ -285,10 +403,12 @@ void on_prev_passed_received(void)
     _agendar_apagar();
 }
 
-/* Recebeu SPD — informativo, guarda velocidade */
+/* Recebeu SPD — refina timeout Tc com ETA real */
 void on_spd_received(float speed, uint32_t eta_ms)
 {
     s_last_speed = speed;
+    if (eta_ms > 0 && s_Tc > 0)
+        s_tc_timeout_ms = _agora_ms() + (uint64_t)(eta_ms * 2);
     ESP_LOGD(TAG, "SPD: %.1fkm/h ETA=%lums",
              speed, (unsigned long)eta_ms);
 }
@@ -444,10 +564,10 @@ void state_machine_update(bool comm_ok, bool is_master)
     /* ----------------------------------------------------------
        1+2. Lê radar e verifica saúde
     ---------------------------------------------------------- */
-    radar_data_t dados;
     bool teve_detecao = false;
 
 #if USE_RADAR
+    radar_data_t dados;
     /* Hardware real */
     teve_detecao = radar_read_data(&dados, NULL);
     if (teve_detecao && radar_vehicle_in_range(&dados))
@@ -456,7 +576,7 @@ void state_machine_update(bool comm_ok, bool is_master)
         sm_on_radar_detect(vel > 0 ? vel : 10.0f);
     }
 #else
-    /* Modo simulado — detecção só via sm_inject_test_car() */
+    _sim_update();
     teve_detecao = false;
 #endif
 
@@ -511,6 +631,19 @@ void state_machine_update(bool comm_ok, bool is_master)
             if (comm_ok)
                 comm_send_status(NEIGHBOR_OK);
         }
+    }
+
+    /* ----------------------------------------------------------
+       6b. Timeout Tc — carro nao chegou (UDP perdido)
+    ---------------------------------------------------------- */
+    if (s_Tc > 0 && s_tc_timeout_ms > 0 &&
+        _agora_ms() >= s_tc_timeout_ms)
+    {
+        ESP_LOGW(TAG, "Tc timeout | Tc=%d->%d", s_Tc, s_Tc-1);
+        s_Tc--;
+        s_tc_timeout_ms = (s_Tc > 0)
+                          ? (_agora_ms() + TC_TIMEOUT_MS) : 0;
+        _agendar_apagar();
     }
 
     /* ----------------------------------------------------------

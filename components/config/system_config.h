@@ -4,8 +4,7 @@
    @file      system_config.h
    @brief     Único ficheiro a editar ao flashar cada poste.
               Define identidade, rede, radar e iluminação.
-   @version   2.1
-   @date      2026-03-19
+   
 
    Projecto  : Poste Inteligente
    Estudantes: Luis Custodio | Tiago Moreno
@@ -29,9 +28,9 @@
    IDENTIFICAÇÃO DO POSTE
    [EDITAR] estas 3 linhas são únicas por poste
 ============================================================ */
-#define POSTE_ID            2          /* ID numérico único (uint8_t) */
+#define POSTE_ID            2        /* ID numérico único (uint8_t) */
 #define POSTE_NAME          "POSTE 02"  /* Nome legível (max 31 chars) */
-#define POST_POSITION       1       /* Posição na cadeia (0=início) */
+#define POST_POSITION       1      /* Posição na cadeia (0=início) */
 
 /* ============================================================
    WI-FI STA (DHCP)
@@ -63,7 +62,21 @@
    FÍSICA / RADAR / ILUMINAÇÃO
 ============================================================ */
 #define POSTE_DIST_M            50      /* Distância entre postes (metros)       */
-#define RADAR_DETECT_M          7       /* Alcance de detecção do radar (metros) */
+
+/* Alcance máximo do HLK-LD2450 em metros.
+   O sensor consegue detectar objectos até ~10m dependendo
+   do tamanho do alvo e da reflexividade.
+   Usado pelo simulador e pelo display (escala do canvas).
+   RADAR_DETECT_M define a zona de acção para acender a luz —
+   RADAR_MAX_M define o campo de visão total do sensor.        */
+#define RADAR_MAX_M             10      /* Alcance máximo do radar (metros)      */
+#define RADAR_MAX_MM            (RADAR_MAX_M * 1000)  /* Idem em milímetros     */
+
+/* Distância a partir da qual o poste acende a 100%.
+   Deve ser <= RADAR_MAX_M.
+   Exemplo: carro detectado a 7m → luz acende imediatamente.  */
+#define RADAR_DETECT_M          7       /* Zona de acção para acender (metros)   */
+
 #define USE_RADAR               0       /* 0 = simulado | 1 = hardware HLK-LD2450 */
 #define LIGHT_MIN               10      /* Brilho mínimo (%)                     */
 #define LIGHT_MAX               100     /* Brilho máximo (%)                     */

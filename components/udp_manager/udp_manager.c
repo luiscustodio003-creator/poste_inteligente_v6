@@ -243,6 +243,7 @@ static void _processar_mensagem(char *msg, const char *ip_origem)
         eta = (uint32_t)atol(p);
         p = strchr(p, ':'); if (!p) return; p++;
         dist = (uint32_t)atol(p);
+        (void)dist;  /* recebido no protocolo, ETA calculado localmente */
 
         ESP_LOGI(TAG, "SPD de ID=%d: %.1fkm/h ETA=%lums",
                  id, vel, (unsigned long)eta);

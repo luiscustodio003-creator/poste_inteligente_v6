@@ -838,6 +838,13 @@ D:/Dev/C/poste_inteligente_v6/build/esp-idf/display_driver/CMakeFiles/list_insta
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/display_driver/CMakeFiles/install.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/display_driver/CMakeFiles/install/local.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/display_driver/CMakeFiles/install/strip.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/__idf_radar_manager.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/edit_cache.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/rebuild_cache.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/list_install_components.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/install.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/install/local.dir
+D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/install/strip.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/lvgl/CMakeFiles/__idf_lvgl.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/lvgl/CMakeFiles/edit_cache.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/lvgl/CMakeFiles/rebuild_cache.dir
@@ -880,13 +887,6 @@ D:/Dev/C/poste_inteligente_v6/build/esp-idf/dali_manager/CMakeFiles/list_install
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/dali_manager/CMakeFiles/install.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/dali_manager/CMakeFiles/install/local.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/dali_manager/CMakeFiles/install/strip.dir
-D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/__idf_radar_manager.dir
-D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/edit_cache.dir
-D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/rebuild_cache.dir
-D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/list_install_components.dir
-D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/install.dir
-D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/install/local.dir
-D:/Dev/C/poste_inteligente_v6/build/esp-idf/radar_manager/CMakeFiles/install/strip.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/state_machine/CMakeFiles/__idf_state_machine.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/state_machine/CMakeFiles/edit_cache.dir
 D:/Dev/C/poste_inteligente_v6/build/esp-idf/state_machine/CMakeFiles/rebuild_cache.dir
