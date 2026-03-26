@@ -1,70 +1,63 @@
 /* ============================================================
-   STATE MACHINE — IMPLEMENTAÇÃO v2.5
+   STATE MACHINE — IMPLEMENTAÇÃO v2.6
    ------------------------------------------------------------
    @file      state_machine.c
    @brief     Máquina de estados do Poste Inteligente
-   @version   2.5
+   @version   2.6
    @date      2026-03-25
 
    Projecto  : Poste Inteligente
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
 
-   FLUXO TEMPORAL CORRECTO (v2.4 → v2.5):
+   FLUXO CORRECTO T / Tc (v2.5 → v2.6):
    ----------------------------------------
-   Problema anterior (v2.4):
-     O poste B recebia TC_INC e acendia IMEDIATAMENTE.
-     O SPD com ETA chegava depois e era tarde demais para
-     servir de agendamento — só refinava o timeout de Tc.
+   Problema v2.5:
+     on_tc_inc_received() propagava TC_INC em cadeia (A→B→C)
+     mas NÃO propagava o SPD com ETA — o poste C recebia TC_INC
+     mas nunca recebia o ETA, ficando sem o timer de pré-acendimento.
 
-   Solução (v2.5):
-     O poste A calcula o ETA assim que detecta o carro.
-     Esse ETA (tempo até o carro chegar à zona de detecção
-     do poste B) é enviado dentro do próprio TC_INC.
-     O poste B recebe o ETA e agenda o acendimento para
-     (ETA - MARGEM_ACENDER_MS) milissegundos no futuro,
-     de modo a estar ACESO antes de o carro chegar.
+     on_prev_passed_received() decrementava T localmente mas não
+     propagava a informação em cadeia — em A→B→C, quando C detecta
+     o carro e envia T-- para B, B decrementava T_B mas A nunca
+     sabia que o carro tinha saído da zona de B.
 
-   Fluxo completo correcto:
-   -------------------------
-     1. Poste A detecta carro a RADAR_DETECT_M metros
-        → T_A++ , Tc_A-- , acende A a 100%
-        → notifica poste anterior: T[prev]--
-        → calcula ETA_B = tempo até carro chegar à zona B
-        → envia TC_INC(vel, ETA_B) para poste B
-        → envia SPD(vel, ETA_B) para poste B (redundante/confirmação)
+   Solução v2.6 — fluxo completo encadeado:
 
-     2. Poste B recebe TC_INC(vel, ETA_B)
-        → Tc_B++
-        → NÃO acende imediatamente
-        → agenda timer: acender em (ETA_B - MARGEM_ACENDER_MS)
-        → regista ETA_B para timeout de segurança
+   ENVIO (poste A detecta carro):
+     A: T_A++, Tc_A-- (se havia)
+     A → B: TC_INC(vel) + SPD(vel, ETA_B)   ← ETA calculado para B
+     B: Tc_B++, agenda acendimento pré-ETA
+     B → C: TC_INC(vel) + SPD(vel, ETA_C)   ← ETA recalculado para C
+     C: Tc_C++, agenda acendimento pré-ETA
+     (propaga até ao último poste online)
 
-     3. Timer expira em poste B (ETA_B - MARGEM_ACENDER_MS)
-        → acende B a 100% PRÉ-CHEGADA do carro
+   CONFIRMAÇÃO (carro chega a B):
+     B: Tc_B--, T_B++
+     B → A: notify_prev_passed (T_A--)       ← A sabe que carro saiu
+     B → C: TC_INC(vel) + SPD(vel, ETA_C)   ← C já sabe mas confirma
 
-     4. Carro chega a poste B (radar B detecta)
-        → T_B++ , Tc_B-- (carro confirmado)
-        → envia TC_INC para poste C (e assim por diante)
+   CONFIRMAÇÃO (carro chega a C):
+     C: Tc_C--, T_C++
+     C → B: notify_prev_passed (T_B--)       ← B sabe que carro saiu
 
-   Margem de acendimento antecipado:
-   -----------------------------------
-     MARGEM_ACENDER_MS = 500 ms
-     Com ETA de 3094ms (50km/h, 50m postes, 7m radar):
-       B acende em 3094 - 500 = 2594ms após A detectar.
-       Carro chega a B em ~3094ms → 500ms de antecedência.
+   RESULTADO final (depois de carro passar por todos):
+     T_A=0, Tc_A=0  → luz A baixa após timeout
+     T_B=0, Tc_B=0  → luz B baixa após timeout
+     T_C=0, Tc_C=0  → luz C baixa após timeout
 
-   Cenários de falha (inalterados de v2.4):
-   ------------------------------------------
-   1. UDP falha           → STATE_AUTONOMO
-   2. Radar falha         → STATE_SAFE_MODE
-   3. Radar recupera      → sai de SAFE_MODE
-   4. UDP recupera        → sai de AUTONOMO
-   5. Viz. dir. offline   → Tc=0 imediatamente
-   6. Viz. esq. offline   → promove-se a MASTER
-   7. Viz. esq. stall     → T limpo após T_STUCK_TIMEOUT_MS
-   8. pos=0 volta online  → MASTER_CLAIM em cadeia
-   9. ETA expirou sem chegada → Tc-- (segurança)
+   CORRECÇÃO em on_tc_inc_received():
+     Quando B recebe TC_INC+SPD de A, propaga TC_INC+SPD para C.
+     O ETA para C = ETA_A_para_B + (POSTE_DIST_M / vel_ms).
+     Simplificação: usa comm_send_tc_inc() + comm_send_spd() que
+     recalculam o ETA com base na velocidade recebida.
+
+   CORRECÇÃO em on_prev_passed_received():
+     Quando B recebe T-- de C, B decrementa T_B E propaga T--
+     para A (comm_notify_prev_passed) se T_B ainda > 0 após
+     o decremento — garante que A também decrementa.
+     NOTA: A propagação só ocorre se havia carro em trânsito
+     confirmado (s_T > 0 antes do decremento).
 
    Dependências:
    -------------
@@ -128,6 +121,10 @@ static bool           s_apagar_pend    = false;
 static bool           s_radar_ok       = true;
 static bool           s_right_online   = true;
 
+/* Contadores para detecção de falha do radar */
+static int s_radar_fail_cnt            = 0;
+static int s_radar_ok_cnt             = 0;
+
 /* Timestamps de controlo (ms desde boot) */
 static uint64_t s_last_detect_ms       = 0;  /* última detecção local  */
 static uint64_t s_left_offline_ms      = 0;  /* viz. esq. ficou offline */
@@ -136,16 +133,19 @@ static bool     s_left_was_offline     = false;
 
 /*
  * NOVO v2.5 — Timer de acendimento antecipado
- * ----------------------------------------------
- * Quando o poste recebe TC_INC com ETA, agenda o acendimento
- * para (agora + ETA - MARGEM_ACENDER_MS).
- * s_acender_em_ms = 0 significa sem acendimento agendado.
  */
 static uint64_t s_acender_em_ms        = 0;
 
-/* Contadores para detecção de falha do radar */
-static int s_radar_fail_cnt            = 0;
-static int s_radar_ok_cnt              = 0;
+/*
+ * NOVO v2.9 — Heartbeat MASTER_CLAIM periódico
+ * -----------------------------------------------
+ * O poste pos=0 envia MASTER_CLAIM em cadeia periodicamente
+ * para garantir que toda a linha sabe quem é o líder.
+ * Intervalo: 30 segundos — suficiente para detectar postes
+ * que recuperaram sem precisar de um evento externo.
+ */
+#define MASTER_CLAIM_HEARTBEAT_MS   30000ULL
+static uint64_t s_master_claim_ms      = 0;
 
 /* ============================================================
    UTILITÁRIOS
@@ -156,41 +156,69 @@ static uint64_t _agora_ms(void)
 }
 
 /* ============================================================
-   SIMULADOR FÍSICO — USE_RADAR=0
+   SIMULADOR FÍSICO — USE_RADAR=0  v2.7
    ------------------------------------------------------------
-   1 carro de cada vez com física real.
-   Ciclo: AGUARDA → EM_VIA → DETECTADO → SAIU → AGUARDA
+   LÓGICA CORRECTA DA CADEIA DE POSTES:
 
-   Velocidades rotativas: 30, 50, 80, 50 km/h.
-   Passo por ciclo (100ms): vy = (vel/3.6) * 100 mm
-   Detecção: quando y_mm <= RADAR_DETECT_M * 1000
+   Apenas o poste MASTER (POST_POSITION == 0) gera carros
+   simulados. Os postes seguintes (IDLE) NÃO geram carros —
+   apenas recebem o carro via UDP (TC_INC + SPD) quando o
+   poste anterior o detecta, e depois o seu próprio simulador
+   "vê" o carro entrar no raio quando o UDP avisa.
 
-   O carro entra pela extremidade máxima (RADAR_MAX_MM),
-   move-se em direcção a y=0 (sensor/poste) e sai quando
-   y_mm <= 0.
+   Fluxo físico real:
+   ------------------
+   1. Poste A (MASTER, pos=0) gera carro a X km/h
+   2. Carro move-se: y decresce de RADAR_MAX_MM até 0
+   3. Quando y <= RADAR_DETECT_MM: A detecta, envia TC_INC+SPD→B
+   4. Quando y <= 0: carro saiu do raio de A
+      → A entra em SIM_SAIU (aguarda T=0 Tc=0)
+
+   Em B (pos=1):
+   5. B recebe TC_INC+SPD → Tc_B++, agenda pré-acendimento
+   6. O simulador de B recebe o carro via on_tc_inc_received()
+      → activa s_sim_carro no estado SIM_ENTRAR com a
+        velocidade recebida e y=RADAR_MAX_MM
+   7. Carro move-se em B, detectado quando y <= RADAR_DETECT_MM
+   8. B detecta → T_B++, Tc_B--, envia TC_INC+SPD→C, PASSED→A
+
+   Em C (pos=2): mesmo processo de B.
+
+   Resultado: o carro "viaja" fisicamente pela cadeia de postes.
+   Cada poste vê o carro entrar e sair do seu raio.
+   O canvas do display de cada poste mostra o carro a mover-se.
+
+   Estados do simulador:
+   ----------------------
+   SIM_AGUARDA  : só MASTER — espera intervalo entre carros
+   SIM_ENTRAR   : carro foi anunciado via UDP, entra no raio
+   SIM_EM_VIA   : carro visível, a mover-se
+   SIM_DETECTADO: zona de detecção atingida, evento disparado
+   SIM_SAIU     : carro passou pelo sensor (y<=0)
 ============================================================ */
 #if USE_RADAR == 0
 
 typedef enum {
-    SIM_AGUARDA   = 0,
-    SIM_EM_VIA,
-    SIM_DETECTADO,
-    SIM_SAIU,
+    SIM_AGUARDA   = 0,  /* só MASTER: aguarda intervalo          */
+    SIM_ENTRAR,         /* carro anunciado via UDP, a entrar      */
+    SIM_EM_VIA,         /* carro visível, a mover-se             */
+    SIM_DETECTADO,      /* zona de detecção atingida             */
+    SIM_SAIU,           /* carro passou, aguarda limpeza T/Tc    */
 } sim_estado_t;
 
 typedef struct {
-    float        y_mm;          /* distância ao sensor (mm)      */
-    float        x_mm;          /* posição lateral (mm)          */
-    float        vy;            /* velocidade em mm/ciclo (100ms)*/
-    float        vel_kmh;       /* velocidade em km/h            */
+    float        y_mm;          /* distância ao sensor (mm)       */
+    float        x_mm;          /* posição lateral (mm)           */
+    float        vy;            /* velocidade mm/ciclo (100ms)    */
+    float        vel_kmh;       /* velocidade km/h                */
     sim_estado_t estado;
-    uint64_t     t_inicio_ms;   /* timestamp início fase actual  */
-    bool         injectado;     /* detecção já disparada?        */
+    uint64_t     t_inicio_ms;
+    bool         injectado;     /* detecção já disparada          */
 } sim_carro_t;
 
 static sim_carro_t s_sim_carro = {0};
 
-/* Intervalo entre carros: TRAFIC_TIMEOUT + 3s de margem */
+/* Intervalo entre carros (só MASTER): TRAFIC_TIMEOUT + 3s */
 #define SIM_INTERVALO_MS  ((uint64_t)(TRAFIC_TIMEOUT_MS + 3000))
 /* Distância de detecção em mm */
 #define SIM_ZONA_MM       ((float)(RADAR_DETECT_M * 1000))
@@ -201,35 +229,85 @@ static int         s_sim_vel_idx = 0;
 
 /* ------------------------------------------------------------
    _sim_iniciar
-   Lança novo carro com velocidade da tabela rotativa.
-   Posição X aleatória dentro de ±384 mm do centro.
+   ------------------------------------------------------------
+   Lança novo carro. Chamado:
+     - pelo MASTER automaticamente após SIM_INTERVALO_MS
+     - pelos postes IDLE quando recebem TC_INC via UDP
+       (vel já conhecida, x_mm pseudo-aleatório)
 ------------------------------------------------------------ */
-static void _sim_iniciar(void)
+static void _sim_iniciar(float vel)
 {
-    float vel = s_sim_vels[s_sim_vel_idx];
-    s_sim_vel_idx = (s_sim_vel_idx + 1) %
-        (sizeof(s_sim_vels) / sizeof(s_sim_vels[0]));
-
-    /* X pseudo-aleatório baseado no timestamp (±384 mm) */
+    /* X pseudo-aleatório dentro de ±384mm do centro */
     s_sim_carro.x_mm        = (float)((int32_t)
                                (_agora_ms() & 0xFF) - 128) * 3.0f;
     s_sim_carro.y_mm        = (float)RADAR_MAX_MM;
     s_sim_carro.vel_kmh     = vel;
-    /* vy em mm por ciclo de 100ms:
-       (vel km/h) / 3.6 = m/s → × 1000 = mm/s → × 0.1 = mm/100ms */
+    /* vy: mm por ciclo de 100ms
+       vel km/h ÷ 3.6 = m/s × 1000 = mm/s × 0.1 = mm/100ms */
     s_sim_carro.vy          = (vel / 3.6f) * 100.0f;
     s_sim_carro.estado      = SIM_EM_VIA;
     s_sim_carro.injectado   = false;
     s_sim_carro.t_inicio_ms = _agora_ms();
 
-    ESP_LOGI("SIM", "Novo carro | %.0f km/h | vy=%.0f mm/ciclo",
-             vel, s_sim_carro.vy);
+    ESP_LOGI("SIM", "Carro entrou | pos=%d | %.0f km/h | vy=%.0fmm/ciclo",
+             POST_POSITION, vel, s_sim_carro.vy);
+}
+
+/* ------------------------------------------------------------
+   sim_notificar_chegada
+   ------------------------------------------------------------
+   Chamado por on_tc_inc_received() quando um poste IDLE
+   recebe aviso via UDP de que um carro vem a caminho.
+   Activa o simulador local para mostrar o carro no canvas
+   quando ele entrar no raio deste poste.
+   Velocidade recebida via UDP para consistência física.
+------------------------------------------------------------ */
+void sim_notificar_chegada(float vel_kmh)
+{
+    if (s_sim_carro.estado != SIM_AGUARDA &&
+        s_sim_carro.estado != SIM_SAIU    &&
+        s_sim_carro.estado != SIM_ENTRAR)
+        return;
+
+    float vy = (vel_kmh / 3.6f) * 100.0f; /* mm por ciclo 100ms */
+
+    /*
+     * O carro está actualmente no poste anterior a percorrer
+     * a distância POSTE_DIST_M até entrar no raio deste poste.
+     * Distância real até ao limite do raio deste poste:
+     *   dist_extra = POSTE_DIST_M - RADAR_MAX_M  (em mm)
+     * O carro percorre essa distância antes de aparecer no canvas.
+     * Representamos isso com y_mm inicial maior que RADAR_MAX_MM:
+     *   y_inicial = RADAR_MAX_MM + dist_extra_mm
+     * Assim o carro só aparece no canvas quando y_mm decresce
+     * abaixo de RADAR_MAX_MM — que coincide com o ETA calculado.
+     */
+    float dist_extra_mm = (float)((POSTE_DIST_M - RADAR_MAX_M) * 1000);
+    if (dist_extra_mm < 0.0f) dist_extra_mm = 0.0f;
+
+    s_sim_carro.vel_kmh     = vel_kmh;
+    s_sim_carro.vy          = vy;
+    s_sim_carro.y_mm        = (float)RADAR_MAX_MM + dist_extra_mm;
+    s_sim_carro.x_mm        = (float)((int32_t)
+                               (_agora_ms() & 0xFF) - 128) * 3.0f;
+    s_sim_carro.estado      = SIM_ENTRAR;
+    s_sim_carro.injectado   = false;
+    s_sim_carro.t_inicio_ms = _agora_ms();
+
+    ESP_LOGI("SIM", "Carro a caminho | pos=%d | %.0f km/h | dist=%.0fmm",
+             POST_POSITION, vel_kmh,
+             (float)RADAR_MAX_MM + dist_extra_mm);
 }
 
 /* ------------------------------------------------------------
    _sim_update
+   ------------------------------------------------------------
    Avança simulação 1 passo (100ms).
    Chamado por state_machine_update() a cada ciclo da FSM.
+
+   MASTER (pos=0): gera carros automaticamente.
+   IDLE   (pos>0): carro entra via sim_notificar_chegada(),
+                   movimenta-se e dispara detecção local.
 ------------------------------------------------------------ */
 static void _sim_update(void)
 {
@@ -237,28 +315,60 @@ static void _sim_update(void)
 
     switch (s_sim_carro.estado)
     {
-        /* ---- AGUARDA: espera intervalo entre carros ---- */
+        /* ---- AGUARDA: só o MASTER actual gera carros ----
+           Condição: is_master (pode ser qualquer poste que
+           ficou sem vizinho esquerdo, não apenas pos=0).
+           Isto cobre o cenário A→B(falha)→C onde C se torna
+           MASTER do seu troço e deve gerar carros simulados. */
         case SIM_AGUARDA:
+            if (s_state != STATE_MASTER) break; /* só MASTER gera */
+
             if (s_sim_carro.t_inicio_ms == 0)
                 s_sim_carro.t_inicio_ms = agora;
 
             if ((agora - s_sim_carro.t_inicio_ms) >= SIM_INTERVALO_MS)
-                _sim_iniciar();
+            {
+                /* Selecciona velocidade rotativa */
+                float vel = s_sim_vels[s_sim_vel_idx];
+                s_sim_vel_idx = (s_sim_vel_idx + 1) %
+                    (sizeof(s_sim_vels) / sizeof(s_sim_vels[0]));
+                _sim_iniciar(vel);
+            }
             break;
 
-        /* ---- EM_VIA / DETECTADO: move o carro ---- */
-        case SIM_EM_VIA:
-        case SIM_DETECTADO:
-            /* Avança carro em direcção ao sensor (y decresce) */
+        /* ---- ENTRAR: carro a percorrer distância entre postes ----
+           y_mm começa em RADAR_MAX_MM + dist_extra e decresce.
+           O carro só aparece no canvas (SIM_EM_VIA) quando
+           y_mm <= RADAR_MAX_MM — que corresponde fisicamente
+           ao momento em que entra no alcance do radar deste poste.
+           Timing: coincide com o ETA calculado pelo poste anterior. */
+        case SIM_ENTRAR:
             s_sim_carro.y_mm -= s_sim_carro.vy;
 
-            /* Dispara detecção UMA VEZ ao entrar na zona */
+            if (s_sim_carro.y_mm <= (float)RADAR_MAX_MM)
+            {
+                /* Limita ao máximo do raio — entra pela borda */
+                s_sim_carro.y_mm   = (float)RADAR_MAX_MM;
+                s_sim_carro.estado = SIM_EM_VIA;
+                ESP_LOGI("SIM", "Carro entrou no raio | pos=%d | y=%.0fmm",
+                         POST_POSITION, s_sim_carro.y_mm);
+            }
+            break;
+
+        /* ---- EM_VIA / DETECTADO: move o carro no raio ---- */
+        case SIM_EM_VIA:
+        case SIM_DETECTADO:
+            /* Avança carro em direcção ao sensor */
+            s_sim_carro.y_mm -= s_sim_carro.vy;
+
+            /* Dispara detecção UMA VEZ ao entrar na zona activa */
             if (!s_sim_carro.injectado &&
                 s_sim_carro.y_mm <= SIM_ZONA_MM)
             {
                 s_sim_carro.estado    = SIM_DETECTADO;
                 s_sim_carro.injectado = true;
-                ESP_LOGI("SIM", "Deteccao | %.0f km/h | y=%.0f mm",
+                ESP_LOGI("SIM", "Deteccao | pos=%d | %.0f km/h | y=%.0fmm",
+                         POST_POSITION,
                          s_sim_carro.vel_kmh, s_sim_carro.y_mm);
                 sm_on_radar_detect(s_sim_carro.vel_kmh);
             }
@@ -269,11 +379,12 @@ static void _sim_update(void)
                 s_sim_carro.y_mm        = 0.0f;
                 s_sim_carro.estado      = SIM_SAIU;
                 s_sim_carro.t_inicio_ms = agora;
-                ESP_LOGI("SIM", "Carro saiu do alcance");
+                ESP_LOGI("SIM", "Carro saiu do raio | pos=%d",
+                         POST_POSITION);
             }
             break;
 
-        /* ---- SAIU: aguarda T=0,Tc=0 + timeout ---- */
+        /* ---- SAIU: aguarda T=0 Tc=0 + timeout para reiniciar ---- */
         case SIM_SAIU:
             if (s_T == 0 && s_Tc == 0 &&
                 (agora - s_sim_carro.t_inicio_ms) >=
@@ -281,7 +392,8 @@ static void _sim_update(void)
             {
                 s_sim_carro.estado      = SIM_AGUARDA;
                 s_sim_carro.t_inicio_ms = agora;
-                ESP_LOGI("SIM", "Pronto para proximo carro");
+                ESP_LOGI("SIM", "Pronto para proximo carro | pos=%d",
+                         POST_POSITION);
             }
             break;
     }
@@ -289,9 +401,8 @@ static void _sim_update(void)
 
 /* ------------------------------------------------------------
    sim_get_objeto
-   Exporta posição actual do carro para o canvas do display.
-   Chamada pelo main.c a cada ciclo de 100ms.
-   Retorna false quando não há carro visível.
+   Exporta posição do carro para o canvas do display.
+   Retorna true apenas quando o carro está visível no raio.
 ------------------------------------------------------------ */
 bool sim_get_objeto(float *x_mm, float *y_mm)
 {
@@ -385,10 +496,11 @@ void state_machine_init(void)
     s_last_detect_ms   = 0;
     s_left_offline_ms  = 0;
     s_tc_timeout_ms    = 0;
-    s_acender_em_ms    = 0;  /* NOVO v2.5 */
+    s_acender_em_ms    = 0;
+    s_master_claim_ms  = 0;
 
     dali_set_brightness(LIGHT_MIN);
-    ESP_LOGI(TAG, "FSM v2.5 iniciada | IDLE | %d%%", LIGHT_MIN);
+    ESP_LOGI(TAG, "FSM v2.6 iniciada | IDLE | %d%%", LIGHT_MIN);
 }
 
 /* ============================================================
@@ -396,22 +508,29 @@ void state_machine_init(void)
    ------------------------------------------------------------
    Chamado quando o radar local confirma carro na zona.
 
-   Fluxo v2.5:
-     1. Cancela apagamento e timer de acendimento pendentes
+   Fluxo v2.6 (corrigido):
+     1. Cancela timer de acendimento antecipado
      2. Tc-- (era "a caminho", agora chegou — confirma)
      3. T++ (está aqui)
      4. Acende 100%
-     5. Notifica poste anterior: T[prev]--
-     6. Calcula ETA para poste B e envia TC_INC + SPD
+     5. Notifica poste ESQUERDO: T[prev]--
+     6. NOVO: notifica poste DIREITO: Tc[next]--
+        (cancela o Tc que foi incrementado pela propagação
+         em cadeia — evita que o poste seguinte conte este
+         carro duas vezes: uma da propagação e outra do TC_INC)
+     7. Envia TC_INC + SPD ao poste direito
+        (Tc[next]++ — resultado líquido: Tc permanece em 1)
 
-   NOTA sobre T:
-     T conta carros PRESENTES confirmados pelo radar local.
-     Decrementa via on_prev_passed_received() enviado pelo
-     poste seguinte quando o seu radar confirma a chegada.
+   Exemplo A→B→C:
+     Passo 1: A detecta → TC_INC→B→C  (Tc_B=1, Tc_C=1)
+     Passo 2: B detecta → PASSED→A (T_A--)
+                        → PASSED→C (Tc_C-- → 0) ← NOVO
+                        → TC_INC→C (Tc_C++ → 1) ← correcto
+     Resultado: Tc_C=1 em vez de Tc_C=2
 ============================================================ */
 void sm_on_radar_detect(float vel)
 {
-    /* Cancela qualquer timer de acendimento antecipado pendente */
+    /* Cancela timer de acendimento antecipado pendente */
     s_acender_em_ms  = 0;
 
     s_apagar_pend    = false;
@@ -430,22 +549,37 @@ void sm_on_radar_detect(float vel)
 
     ESP_LOGI(TAG, "Radar: %.1f km/h | T=%d Tc=%d", vel, s_T, s_Tc);
 
-    /* Notifica poste anterior: carro saiu da sua zona */
+    /* Notifica poste ESQUERDO: carro saiu da sua zona (T--) */
     comm_notify_prev_passed(vel);
 
-    /* Informa poste direito com velocidade e ETA calculado */
     if (s_right_online)
     {
         /*
-         * Ordem correta (v2.5):
-         *   1. TC_INC: aviso imediato de carro a caminho
-         *      (o poste B agenda acendimento com o ETA que vem
-         *       no SPD logo a seguir — latência UDP ~1ms local)
-         *   2. SPD:    confirma velocidade e ETA para o poste B
-         *              usar em on_spd_received()
+         * CORRECÇÃO v2.6 — cancelar Tc duplicado no poste direito:
+         *
+         * O poste direito já tem Tc=1 da propagação em cadeia
+         * (A→B→C: quando A detectou, B propagou TC_INC→C).
+         * Se enviarmos TC_INC directamente, Tc_C passa a 2
+         * com o mesmo carro — duplicação incorrecta.
+         *
+         * Solução: enviar primeiro PASSED ao vizinho direito
+         * para cancelar o Tc da propagação anterior (Tc_C--).
+         * Depois enviar TC_INC normalmente (Tc_C++).
+         * Resultado líquido: Tc_C permanece em 1.
+         *
+         * Excepção: POST_POSITION == 0 é o primeiro poste da
+         * cadeia — nunca houve propagação anterior para cancelar.
          */
-        comm_send_tc_inc(vel);
-        comm_send_spd(vel);
+        if (POST_POSITION > 0)
+        {
+            /* Cancela Tc da propagação anterior no poste direito */
+            comm_notify_prev_passed(vel);   /* → Tc[direito]-- */
+            ESP_LOGD(TAG, "PASSED→dir: cancela Tc propagação anterior");
+        }
+
+        /* Anuncia carro a chegar ao poste direito */
+        comm_send_tc_inc(vel);   /* → Tc[direito]++ */
+        comm_send_spd(vel);      /* → agenda pré-acendimento */
     }
     else
     {
@@ -493,54 +627,80 @@ void sm_on_right_neighbor_online(void)
    ------------------------------------------------------------
    Recebeu TC_INC(vel) do poste anterior — carro a caminho.
 
-   Fluxo v2.5 — acendimento PRÉ-ETA:
+   Fluxo v2.6:
      1. Tc++
-     2. NÃO acende imediatamente
-     3. Aguarda on_spd_received() que traz o ETA calculado
-        pelo poste anterior (chega ~1ms depois via UDP)
-     4. on_spd_received() agenda s_acender_em_ms = agora+ETA-MARGEM
+     2. NÃO acende imediatamente — aguarda SPD com ETA
+     3. Propaga TC_INC + SPD para vizinho direito
+        (o SPD recalcula o ETA para o poste seguinte)
 
-   Fallback de segurança:
-     Se on_spd_received() não chegar em TC_TIMEOUT_MS,
-     o timeout de Tc limpa o contador (cenário de UDP perdido).
-     Adicionalmente, se s_acender_em_ms não for preenchido
-     em 1000ms, acende por precaução (ver state_machine_update).
+   CORRECÇÃO v2.6:
+     v2.5 propagava apenas TC_INC em cadeia mas não o SPD.
+     Sem SPD, o poste C nunca recebia o ETA e ficava sem
+     o timer de pré-acendimento (s_acender_em_ms = 0).
+     Agora propaga TC_INC + SPD para garantir que TODOS
+     os postes da cadeia recebem o ETA correctamente.
 ------------------------------------------------------------ */
 void on_tc_inc_received(float speed)
 {
-    s_apagar_pend = false;
-    s_last_speed  = speed;
+    s_apagar_pend    = false;
+    s_last_speed     = speed;
     s_Tc++;
-
-    /*
-     * NÃO acender ainda — espera o ETA do SPD para decidir
-     * quando acender. O SPD chega imediatamente a seguir
-     * (enviado logo após TC_INC em sm_on_radar_detect).
-     *
-     * Regista timestamp de chegada do TC_INC para o fallback
-     * de segurança em state_machine_update().
-     */
     s_last_detect_ms = _agora_ms();
     s_tc_timeout_ms  = _agora_ms() + TC_TIMEOUT_MS;
 
-    /* Propaga TC_INC em cadeia (A→B→C→D...) */
-    if (s_right_online)
-        comm_send_tc_inc(speed);
+    /*
+     * SIMULAÇÃO v2.7: activa o simulador local para mostrar
+     * o carro no canvas quando ele entrar no raio deste poste.
+     * Só relevante com USE_RADAR=0 — com hardware real o radar
+     * detecta o carro fisicamente sem necessidade disto.
+     */
+#if USE_RADAR == 0
+    sim_notificar_chegada(speed);
+#endif
 
-    ESP_LOGI(TAG, "TC_INC recebido | %.1f km/h | T=%d Tc=%d"
-                  " | aguardar SPD para ETA",
+    /* Propaga TC_INC + SPD em cadeia para o vizinho direito */
+    if (s_right_online)
+    {
+        comm_send_tc_inc(speed);
+        comm_send_spd(speed);
+    }
+
+    ESP_LOGI(TAG, "TC_INC recebido | %.1f km/h | T=%d Tc=%d",
              speed, s_T, s_Tc);
 }
 
 /* ------------------------------------------------------------
    on_prev_passed_received
-   Recebeu TC_INC com vel<0 — carro saiu: T--
+   ------------------------------------------------------------
+   Recebeu notificação do poste seguinte — carro saiu: T--
+
+   CORRECÇÃO v2.6:
+     Quando o poste seguinte confirma a chegada do carro,
+     este poste deve decrementar TANTO T como Tc:
+       T--  : carro saiu da zona local
+       Tc-- : cancela Tc da propagação anterior
+     E propagar em cadeia para o poste esquerdo.
 ------------------------------------------------------------ */
 void on_prev_passed_received(void)
 {
-    if (s_T > 0) s_T--;
+    bool tinha_T  = (s_T  > 0);
+    bool tinha_Tc = (s_Tc > 0);
 
-    ESP_LOGD(TAG, "Carro passou (T--) | T=%d Tc=%d", s_T, s_Tc);
+    /* Decrementa T (carro saiu) e Tc (cancela propagação) */
+    if (s_T  > 0) s_T--;
+    if (s_Tc > 0) s_Tc--;
+
+    ESP_LOGD(TAG, "Carro passou | T=%d Tc=%d", s_T, s_Tc);
+
+    /*
+     * Propaga PASSED para o poste esquerdo se havia T ou Tc.
+     * A cadeia propaga-se até ao início (onde T=0 e Tc=0).
+     * Condição: só propaga se havia algo a decrementar —
+     * evita propagação infinita de zeros.
+     */
+    if (tinha_T || tinha_Tc)
+        comm_notify_prev_passed(s_last_speed);
+
     _agendar_apagar();
 }
 
@@ -711,6 +871,25 @@ static void _verificar_vizinho_esquerdo(bool comm_ok, bool is_master)
     {
         s_left_was_offline = false;
         ESP_LOGI(TAG, "Viz. esq. voltou online");
+
+        /*
+         * Quando o vizinho esquerdo volta online (ex: B recuperou),
+         * este poste pode estar em MASTER (foi promovido durante
+         * a falha). O pos=0 (A) vai enviar MASTER_CLAIM em cadeia
+         * assim que detectar B — mas B pode não saber que deve
+         * ficar em IDLE se ninguém lhe disser.
+         *
+         * Solução: se este poste é MASTER e o vizinho esquerdo
+         * voltou, envia MASTER_CLAIM para o vizinho direito
+         * em cadeia, propagando a liderança correctamente.
+         * O pos=0 (A) não precisa disto — é sempre MASTER.
+         */
+        if (s_state == STATE_MASTER && POST_POSITION > 0)
+        {
+            ESP_LOGI(TAG, "Viz. esq. voltou — cedendo MASTER em cadeia");
+            s_state = STATE_IDLE;
+            comm_send_master_claim();
+        }
     }
 
     /* Actualiza estado MASTER */
@@ -902,7 +1081,35 @@ void state_machine_update(bool comm_ok, bool is_master)
             {
                 ESP_LOGI(TAG, "pos=0 volta online → MASTER_CLAIM");
                 comm_send_master_claim();
+                s_master_claim_ms = _agora_ms();
             }
+        }
+    }
+
+    /* ----------------------------------------------------------
+       11. Heartbeat MASTER_CLAIM periódico (v2.9)
+       ----------------------------------------------------------
+       O poste pos=0 envia MASTER_CLAIM em cadeia a cada
+       MASTER_CLAIM_HEARTBEAT_MS (30s). Garante que postes
+       que recuperaram de falha recebem a confirmação de quem
+       é o líder da linha, mesmo que não haja tráfego activo.
+
+       Exemplo: B falhou e recuperou. A continuou a funcionar
+       normalmente. B arranca sem saber o seu papel. No máximo
+       30s depois, A envia MASTER_CLAIM → B recebe → B fica IDLE
+       → B propaga para C → C cede MASTER e volta a IDLE.
+    ---------------------------------------------------------- */
+    if (POST_POSITION == 0 && comm_ok &&
+        s_state == STATE_MASTER)
+    {
+        uint64_t agora = _agora_ms();
+        if (s_master_claim_ms == 0 ||
+            (agora - s_master_claim_ms) >= MASTER_CLAIM_HEARTBEAT_MS)
+        {
+            ESP_LOGI(TAG, "Heartbeat MASTER_CLAIM (cada %llus)",
+                     MASTER_CLAIM_HEARTBEAT_MS / 1000ULL);
+            comm_send_master_claim();
+            s_master_claim_ms = agora;
         }
     }
 }

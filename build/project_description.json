@@ -1,7 +1,7 @@
 {
     "version":            "1.2",
     "project_name":       "poste_inteligente_v6",
-    "project_version":    "9ecee1b-dirty",
+    "project_version":    "66aadaa-dirty",
     "project_path":       "D:/Dev/C/poste_inteligente_v6",
     "idf_path":           "C:/esp/v5.4.3/esp-idf",
     "build_dir":          "D:/Dev/C/poste_inteligente_v6/build",

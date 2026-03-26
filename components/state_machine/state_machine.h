@@ -3,7 +3,7 @@
    ------------------------------------------------------------
    @file      state_machine.h
    @brief     Máquina de estados do Poste Inteligente
-   @version   2.4
+   @version   2.9
    @date      2026-03-25
 
    Projecto  : Poste Inteligente
@@ -189,5 +189,16 @@ bool state_machine_radar_ok(void);
  * @return true se carro está visível no canvas
  */
 bool sim_get_objeto(float *x_mm, float *y_mm);
+
+/**
+ * @brief Notifica o simulador que um carro vem a caminho.
+ *        Chamada internamente por on_tc_inc_received().
+ *        Activa o simulador local para mostrar o carro
+ *        no canvas quando entrar no raio deste poste.
+ *        Só relevante com USE_RADAR=0 (modo simulado).
+ *        Com USE_RADAR=1 o radar físico detecta sozinho.
+ * @param vel_kmh Velocidade do carro em km/h
+ */
+void sim_notificar_chegada(float vel_kmh);
 
 #endif /* STATE_MACHINE_H */
