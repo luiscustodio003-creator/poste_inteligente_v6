@@ -77,7 +77,7 @@
    Exemplo: carro detectado a 7m → luz acende imediatamente.  */
 #define RADAR_DETECT_M          7       /* Zona de acção para acender (metros)   */
 
-#define USE_RADAR               0       /* 0 = simulado | 1 = hardware HLK-LD2450 */
+#define USE_RADAR               1       /* 0 = simulado | 1 = hardware HLK-LD2450 */
 #define LIGHT_MIN               10      /* Brilho mínimo (%)                     */
 #define LIGHT_MAX               100     /* Brilho máximo (%)                     */
 #define LIGHT_SAFE_MODE         50      /* Brilho em modo seguro (%)             */

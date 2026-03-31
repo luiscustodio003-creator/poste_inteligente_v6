@@ -41,9 +41,9 @@
    RADAR HLK-LD2450 — UART
 ============================================================ */
 #define RADAR_UART_PORT     UART_NUM_2  /* UART2 do ESP32          */
-#define RADAR_PIN_TX        17          /* TX do ESP32 → RX radar  */
-#define RADAR_PIN_RX        16          /* RX do ESP32 ← TX radar  */
-#define RADAR_BAUD_RATE     256000      /* Baud rate do HLK-LD2450 */
+#define RADAR_PIN_TX        27         /* TX do ESP32 → RX radar  */
+#define RADAR_PIN_RX        22          /* RX do ESP32 ← TX radar  */
+#define RADAR_BAUD_RATE     115200      /* Baud rate do HLK-LD2450 */
 
 /* ============================================================
    LUMINÁRIA — PWM (LEDC)

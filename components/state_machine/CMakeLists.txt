@@ -11,4 +11,5 @@ idf_component_register(
         config          # system_config.h:
                         #   TRAFIC_TIMEOUT_MS, LIGHT_MIN/MAX/SAFE_MODE
                         #   USE_RADAR, POST_POSITION
+      
 )

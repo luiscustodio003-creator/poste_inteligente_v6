@@ -108,7 +108,7 @@
    aparecem erradas no ecrã físico (vermelho→azul, etc).
 ============================================================ */
 #define LV_COLOR_DEPTH          16
-#define LV_COLOR_16_SWAP         1   /* ← CORRIGIDO v5.0 (era 0) */
+#define LV_COLOR_16_SWAP         0   /* ← CORRIGIDO v5.0 (era 0) */
 #define LV_COLOR_SCREEN_TRANSP   0
 
 

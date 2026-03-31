@@ -85,6 +85,7 @@
 #include <lvgl.h>
 #include "freertos/FreeRTOS.h"
 #include "freertos/queue.h"
+#include "esp_timer.h"
 
 /* ============================================================
    ETIQUETA DE LOG
@@ -121,7 +122,7 @@ typedef struct {
         /* DM_MSG_WIFI */
         struct { bool connected; char ip[16]; } wifi;
         /* DM_MSG_HARDWARE */
-        struct { bool radar_ok; uint8_t brightness; } hw;
+        struct { char radar_st[8]; bool radar_ok; uint8_t brightness; } hw;
         /* DM_MSG_TRAFFIC */
         struct { int T; int Tc; } traf;
         /* DM_MSG_SPEED */
@@ -154,41 +155,43 @@ static QueueHandle_t s_fila = NULL;
 #endif
 
 /* ============================================================
-   PALETA DE CORES — hex RGB888
-   ------------------------------------------------------------
-   CORRECÇÃO v5.2: COR_VERDE e COR_VERMELHO estavam trocados
-   no código original v5.0. Valores corrigidos:
-     COR_VERDE    : era 0xC00028 (vermelho!) → agora 0x22C55E (verde)
-     COR_VERMELHO : era 0x001840 (azul!)    → agora 0xFF3333 (vermelho)
-   Restantes cores melhoradas para maior contraste no ST7789.
+   PALETA DE CORES — 24-bit 0xRRGGBB para lv_color_hex()
+   NOTA: lv_color_hex() espera 24-bit RGB, NÃO RGB565.
 ============================================================ */
-#define COR_BRANCO      0xF0F0F0   /* branco ligeiramente quente       */
-#define COR_PRETO       0x000000   /* fundo do ecrã                    */
-#define COR_CINZENTO    0x707068   /* texto inactivo / subtítulos      */
-#define COR_CINZ_CLARO  0xA0A098   /* cinzento claro para labels       */
-#define COR_VERDE       0x22C55E   /* CORRIGIDO: verde online / MASTER */
-#define COR_VERMELHO    0xFF3333   /* CORRIGIDO: vermelho offline/erro */
-#define COR_AMARELO     0xFACC15   /* T activo / LIGHT ON              */
-#define COR_LARANJA     0xFB923C   /* SAFE MODE                        */
-#define COR_CIANO       0x22D3EE   /* Tc activo                        */
-#define COR_VIOLETA     0xC084FC   /* velocidade activa                */
-#define COR_SEPARADOR   0x2A2A2A   /* linhas divisórias                */
-#define COR_FUNDO_CARD  0x0D0D0D   /* fundo dos cards de tráfego       */
-#define COR_AZUL_INFO   0x60A5FA   /* informação neutra                */
 
-/* Cores internas do canvas radar */
-#define COR_RADAR_FUNDO  0x010601  /* preto esverdeado profundo        */
-#define COR_RADAR_GRELHA 0x0F1F0F  /* linhas de grelha subtis          */
-#define COR_RADAR_EIXO   0x1A3A1A  /* eixo central e base              */
-#define COR_RADAR_SCAN   0x22C55E  /* linha de sweep (verde vivo)      */
+#define COR_BRANCO      0xFFFFFF  /* branco puro                  */
+#define COR_PRETO       0x000000  /* preto                        */
+#define COR_CINZENTO    0x6B7280  /* cinzento médio               */
+#define COR_CINZ_CLARO  0x9CA3AF  /* cinzento claro               */
+
+#define COR_VERDE       0x22C55E  /* verde online/MASTER (= canvas) */
+#define COR_VERMELHO    0xFF3333  /* vermelho erro/offline (= canvas) */
+#define COR_AMARELO     0xF5C542  /* amarelo dourado — card T       */
+#define COR_LARANJA     0xFF8C00  /* laranja                        */
+#define COR_CIANO       0x00D4FF  /* ciano — card Tc                */
+#define COR_VIOLETA     0xA855F7  /* violeta — card km/h            */
+
+#define COR_SEPARADOR   0x374151  /* cinzento azulado escuro        */
+#define COR_FUNDO_CARD  0x1A2232  /* fundo card muito escuro        */
+#define COR_AZUL_INFO   0x3B82F6  /* azul informação                */
+
+/* ============================================================
+   CORES INTERNAS DO CANVAS RADAR — 24-bit para lv_color_hex()
+============================================================ */
+
+#define COR_RADAR_FUNDO  0x010601  /* preto esverdeado profundo    */
+#define COR_RADAR_GRELHA 0x0D3D0D  /* grelha verde subtil          */
+#define COR_RADAR_EIXO   0x1A3A1A  /* eixo central e base          */
+#define COR_RADAR_SCAN   0x22C55E  /* sweep verde vivo             */
 
 /* ============================================================
    DIMENSÕES DO CANVAS DO RADAR
 ============================================================ */
-#define RADAR_W         230   /* largura do canvas em px              */
-#define RADAR_H          90   /* altura do canvas em px               */
-#define RADAR_X_OFF       5   /* margem esquerda no ecrã              */
-#define RADAR_Y_OFF     149   /* y de início do canvas no ecrã        */
+
+#define RADAR_W         230
+#define RADAR_H          90
+#define RADAR_X_OFF       5
+#define RADAR_Y_OFF     149
 
 /* ============================================================
    PONTEIROS PARA ELEMENTOS VISUAIS
@@ -225,7 +228,9 @@ static lv_color_t radar_buf[RADAR_W * RADAR_H];
 
 /* Estado interno dos objectos radar */
 static radar_obj_t s_radar_objs[RADAR_MAX_OBJ];
-static uint8_t     s_radar_count = 0;
+static uint8_t     s_radar_count     = 0;
+static uint32_t    s_radar_last_ms   = 0;   /* timestamp última detecção real */
+#define RADAR_HOLD_MS  500                  /* mantém último ponto 500ms sem frame */
 
 
 /* ============================================================
@@ -838,8 +843,7 @@ void display_manager_task(void)
                 if (!label_wifi) break;
                 if (msg.wifi.connected) {
                     char buf[36];
-                    snprintf(buf, sizeof(buf), "WiFi: ON  %s",
-                             msg.wifi.ip[0] ? msg.wifi.ip : "---");
+                    snprintf(buf, sizeof(buf), "WiFi: ON  %s", msg.wifi.ip[0] ? msg.wifi.ip : "---");
                     lv_label_set_text(label_wifi, buf);
                     lv_obj_set_style_text_color(label_wifi, lv_color_hex(COR_VERDE), 0);
                 } else {
@@ -851,10 +855,16 @@ void display_manager_task(void)
             /* ---- HARDWARE ---- */
             case DM_MSG_HARDWARE:
                 if (label_radar_st) {
-                    lv_label_set_text(label_radar_st,
-                        msg.hw.radar_ok ? "Radar: OK" : "Radar: ERR");
+                    char rbuf[20];
+                    snprintf(rbuf, sizeof(rbuf), "Radar: %s", msg.hw.radar_st);
+                    lv_label_set_text(label_radar_st, rbuf);
+                    /* REAL → verde | SIM → amarelo | FAIL → vermelho */
+                    uint32_t cor = COR_VERMELHO;
+                    if (msg.hw.radar_ok) {
+                        cor = (msg.hw.radar_st[0] == 'S') ? 0xFFAA00 : COR_VERDE;
+                    }
                     lv_obj_set_style_text_color(label_radar_st,
-                        lv_color_hex(msg.hw.radar_ok ? COR_VERDE : COR_VERMELHO), 0);
+                        lv_color_hex(cor), 0);
                 }
                 if (label_dali) {
                     char buf[14];
@@ -928,15 +938,27 @@ void display_manager_task(void)
                 break;
 
             /* ---- RADAR ---- */
-            case DM_MSG_RADAR:
-                s_radar_count = msg.radar.count;
-                if (msg.radar.count > 0)
+            case DM_MSG_RADAR: {
+                uint32_t agora = (uint32_t)(esp_timer_get_time() / 1000ULL);
+                if (msg.radar.count > 0) {
+                    /* Frame com detecção — actualiza e guarda timestamp */
+                    s_radar_count  = msg.radar.count;
+                    s_radar_last_ms = agora;
                     memcpy(s_radar_objs, msg.radar.objs,
                            msg.radar.count * sizeof(radar_obj_t));
-                else
-                    memset(s_radar_objs, 0, sizeof(s_radar_objs));
+                } else {
+                    /* Sem frame novo — só apaga se passaram RADAR_HOLD_MS
+                     * sem nenhuma detecção. Evita flicker entre frames do
+                     * sensor (10 Hz) e ciclos da FSM (10 Hz, desfasados). */
+                    if (s_radar_count > 0 &&
+                        (agora - s_radar_last_ms) >= RADAR_HOLD_MS) {
+                        s_radar_count = 0;
+                        memset(s_radar_objs, 0, sizeof(s_radar_objs));
+                    }
+                }
                 _radar_redraw();
                 break;
+            }
 
             default:
                 break;
@@ -982,10 +1004,12 @@ void display_manager_set_wifi(bool connected, const char *ip)
     xQueueSend(s_fila, &msg, 0);
 }
 
-void display_manager_set_hardware(bool radar_ok, uint8_t brightness)
+void display_manager_set_hardware(const char *radar_st, bool radar_ok, uint8_t brightness)
 {
     if (!s_fila) return;
     dm_msg_t msg = { .tipo = DM_MSG_HARDWARE };
+    strncpy(msg.hw.radar_st, radar_st ? radar_st : "---", sizeof(msg.hw.radar_st) - 1);
+    msg.hw.radar_st[sizeof(msg.hw.radar_st) - 1] = '\0';
     msg.hw.radar_ok   = radar_ok;
     msg.hw.brightness = brightness;
     xQueueSend(s_fila, &msg, 0);

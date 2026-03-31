@@ -149,7 +149,7 @@ void st7789_init(void)
        0x00 → RGB normal
        0x08 → BGR (se cores trocadas) */
     write_cmd(0x36);
-    uint8_t madctl = 0x08;  /* BGR — corrigido para display fisico */
+    uint8_t madctl = 0x08;  /* RGB — corrigido para display fisico */
     write_data(&madctl, 1);
 
     /* Inversão (comentar se cores estranhas) */

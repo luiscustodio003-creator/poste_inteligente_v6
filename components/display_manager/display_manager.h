@@ -140,10 +140,11 @@ void display_manager_set_wifi(bool connected, const char *ip);
 
 /**
  * @brief Actualiza estado radar e brilho DALI.
- * @param radar_ok   true se radar responde normalmente.
+ * @param radar_st   String do estado: "REAL", "SIM", ou "FAIL".
+ * @param radar_ok   true se radar responde (REAL ou SIM); false = FAIL.
  * @param brightness Brilho DALI actual em percentagem (0-100).
  */
-void display_manager_set_hardware(bool radar_ok, uint8_t brightness);
+void display_manager_set_hardware(const char *radar_st, bool radar_ok, uint8_t brightness);
 
 /**
  * @brief Actualiza contadores de tráfego T e Tc.

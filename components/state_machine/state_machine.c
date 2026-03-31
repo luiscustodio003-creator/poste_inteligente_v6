@@ -122,6 +122,7 @@ static bool           s_radar_ok       = true;
 static int            s_radar_fail_cnt = 0;
 static int            s_radar_ok_cnt   = 0;
 static bool           s_right_online   = true;
+static bool           s_veiculo_presente = false; /* debounce: rising edge */
 
 /* Timestamps de controlo (ms desde boot) */
 static uint64_t s_last_detect_ms       = 0;  /* ultima deteccao local  */
@@ -496,6 +497,7 @@ void state_machine_init(void)
     s_tc_timeout_ms    = 0;
     s_acender_em_ms    = 0;
     s_master_claim_ms  = 0;
+    s_veiculo_presente = false;
 
     dali_set_brightness(LIGHT_MIN);
     ESP_LOGI(TAG, "FSM v2.6 iniciada | IDLE | %d%%", LIGHT_MIN);
@@ -921,11 +923,18 @@ void state_machine_update(bool comm_ok, bool is_master)
 #if USE_RADAR
     radar_data_t dados;
     teve_detecao = radar_read_data(&dados, NULL);
-    if (teve_detecao && radar_vehicle_in_range(&dados))
+
+    /* Debounce: só dispara sm_on_radar_detect na transição
+     * ausente→presente (rising edge). Sem isto, cada ciclo de
+     * 100ms com veículo no campo enviava TC_INC ao poste direito
+     * e PASSED ao esquerdo, corrompendo os contadores T/Tc.   */
+    bool veiculo_agora = teve_detecao && radar_vehicle_in_range(&dados);
+    if (veiculo_agora && !s_veiculo_presente)
     {
         float vel = radar_get_closest_speed(&dados);
         sm_on_radar_detect(vel > 0.0f ? vel : 10.0f);
     }
+    s_veiculo_presente = veiculo_agora;
 #else
     _sim_update();
     teve_detecao = false; /* simulado - saude sempre OK */
