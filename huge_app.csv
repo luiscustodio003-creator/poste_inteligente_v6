@@ -1,0 +1,7 @@
+# Tabela de particoes — ESP32 4MB flash
+# Poste Inteligente v6
+#
+# Nome      Tipo   SubTipo   Offset    Tamanho
+nvs,        data,  nvs,      0x9000,   0x5000,
+phy_init,   data,  phy,      0xe000,   0x1000,
+factory,    app,   factory,  0x10000,  0x300000,

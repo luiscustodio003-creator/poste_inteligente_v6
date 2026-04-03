@@ -28,9 +28,9 @@
    IDENTIFICAÇÃO DO POSTE
    [EDITAR] estas 3 linhas são únicas por poste
 ============================================================ */
-#define POSTE_ID            2       /* ID numérico único (uint8_t) */
+#define POSTE_ID            2      /* ID numérico único (uint8_t) */
 #define POSTE_NAME          "POSTE 02"  /* Nome legível (max 31 chars) */
-#define POST_POSITION       1     /* Posição na cadeia (0=início) */
+#define POST_POSITION       1   /* Posição na cadeia (0=início) */
 
 /* ============================================================
    WI-FI STA (DHCP)

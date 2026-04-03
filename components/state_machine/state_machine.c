@@ -1,16 +1,87 @@
 /* ============================================================
-   STATE MACHINE - IMPLEMENTACAO v2.6
+   STATE MACHINE - IMPLEMENTACAO v2.8
    ------------------------------------------------------------
    @file      state_machine.c
    @brief     Maquina de estados do Poste Inteligente
-   @version   2.6
-   @date      2026-03-25
+   @version   2.8
+   @date      2026-04-01
 
    Projecto  : Poste Inteligente
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
 
-   FLUXO CORRECTO T / Tc (v2.5 -> v2.6):
+   Correcções v2.7 → v2.8:
+   -------------------------
+   CORRECÇÃO A — BUG CRÍTICO: SAFE_MODE bloqueava o UDP
+     Problema: quando o radar falhava, o return no passo 3 do
+     state_machine_update() impedia que os passos 6-11 corressem.
+     O ETA por UDP (s_acender_em_ms) era ignorado — o carro passava
+     no escuro mesmo com o UDP a funcionar correctamente.
+     Solução:
+       - Se radar falha MAS comm_ok E Tc>0 → não entra em SAFE_MODE,
+         processa o ETA normalmente (UDP é fonte suficiente).
+       - SAFE_MODE só activa quando radar E UDP falham em simultâneo.
+       - O estado SAFE_MODE é registado internamente mas o update
+         continua a correr (sem return prematuro).
+
+   CORRECÇÃO B — Transição SAFE_MODE → AUTONOMO
+     Quando o poste está em SAFE_MODE (radar falhou) e o UDP
+     também falha, deve transitar para AUTONOMO — não há nenhuma
+     fonte de informação. O passo 10 (AUTONOMO) passou a verificar
+     explicitamente esta transição.
+
+   CORRECÇÃO C — Recuperação do radar com Tc>0
+     Quando o radar recupera e havia Tc>0, o código anterior
+     chamava _aplicar_brilho() que acendia imediatamente a 100%.
+     O carro pode já ter passado durante a falha do radar.
+     Solução: re-agenda s_acender_em_ms com base no Tc restante
+     em vez de acender imediatamente.
+
+   ADIÇÃO D — STATE_OBSTACULO (novo estado v2.8)
+     Detecta obstáculo estático persistente (carro em avaria,
+     objecto metálico grande imóvel) via radar_static_object_present().
+     Condição: alvo com speed < 3 km/h durante 80 frames (8 segundos).
+     Acção: luz 100% contínuo + STATUS:OBST enviado a vizinhos.
+     Os vizinhos que recebem OBST também acendem a 100% como
+     sinalização de perigo na cadeia.
+     Saída: quando o alvo desaparece do campo (count==0 por
+     OBSTACULO_CLEAR_FRAMES consecutivos).
+
+
+   -------------------------
+   CORRECÇÃO 1 — BUG: s_Tc = 0 em sm_on_radar_detect() (linha 540)
+     Quando o radar detecta um carro, o código zerava todos os Tc
+     em vez de decrementar apenas um.
+     Com Tc=2 (dois carros a caminho), quando o primeiro chegava,
+     o segundo era completamente esquecido.
+     Correcção: if (s_Tc > 0) s_Tc--
+
+   CORRECÇÃO 2 — BUG: s_Tc = 0 em on_prev_passed_received() (linha 675)
+     Mesmo problema na direcção oposta. Quando o poste seguinte
+     confirmava a chegada de um carro, este poste zerava todo o Tc.
+     Se havia mais um carro atrás (Tc=2), o segundo era perdido.
+     Correcção: if (s_Tc > 0) s_Tc--
+
+   CORRECÇÃO 3 — BUG: s_acender_em_ms duplicado em sm_on_radar_detect()
+     A linha s_acender_em_ms = 0 aparecia duas vezes consecutivas
+     (linhas 533 e 541). A segunda era código morto — sem efeito
+     mas confuso para leitura. Removida a duplicação.
+
+   MELHORIA 4 — Renomear teve_detecao → teve_frame
+     A variável significava "recebeu frame válido do sensor"
+     (true mesmo quando count=0 — zona vazia, frame normal).
+     O nome teve_detecao sugeria erroneamente "detectou veículo".
+     Renomeada para teve_frame — comportamento idêntico, semântica
+     correcta. Evita leituras erradas do código.
+
+   Dependencias:
+   -------------
+   - dali_manager.h  : controlo PWM da luminaria
+   - comm_manager.h  : envio de mensagens UDP
+   - radar_manager.h : leitura do sensor HLK-LD2450
+   - system_config.h : TRAFIC_TIMEOUT_MS, LIGHT_*, POST_POSITION
+
+
    ----------------------------------------
    Problema v2.5:
      on_tc_inc_received() propagava TC_INC em cadeia (A->B->C)
@@ -107,8 +178,15 @@ static const char *TAG = "FSM";
 #endif
 
 /* Leituras consecutivas para confirmar falha/recuperacao do radar */
-#define RADAR_FAIL_COUNT    10
+#define RADAR_FAIL_COUNT    50
 #define RADAR_OK_COUNT       3
+
+/*
+ * Frames consecutivos sem alvo para confirmar saída do OBSTACULO.
+ * 10 frames × 100ms = 1 segundo de zona limpa antes de voltar a IDLE.
+ * Evita que uma micro-ausência no campo cause saída prematura.
+ */
+#define OBSTACULO_CLEAR_FRAMES  10
 
 /* ============================================================
    ESTADO INTERNO DA FSM
@@ -121,8 +199,22 @@ static bool           s_apagar_pend    = false;
 static bool           s_radar_ok       = true;
 static int            s_radar_fail_cnt = 0;
 static int            s_radar_ok_cnt   = 0;
-static bool           s_right_online   = true;
-static bool           s_veiculo_presente = false; /* debounce: rising edge */
+static bool           s_right_online      = true;
+static bool           s_veiculo_presente  = false; /* debounce: rising edge */
+
+/*
+ * v2.8 — Estado de modo degradado e obstáculo
+ * ----------------------------------------------
+ * s_radar_degradado : true quando radar falhou mas UDP funciona.
+ *   Poste opera em modo degradado — usa ETA por UDP para acender.
+ *   Não entra em SAFE_MODE enquanto comm_ok E Tc>0.
+ *
+ * s_obstaculo_clear_cnt : frames consecutivos sem alvo no campo
+ *   após STATE_OBSTACULO. Ao atingir OBSTACULO_CLEAR_FRAMES,
+ *   volta a IDLE e envia STATUS:OK aos vizinhos.
+ */
+static bool     s_radar_degradado     = false;
+static uint16_t s_obstaculo_clear_cnt = 0;
 
 /* Timestamps de controlo (ms desde boot) */
 static uint64_t s_last_detect_ms       = 0;  /* ultima deteccao local  */
@@ -429,7 +521,7 @@ static void _aplicar_brilho(void)
 {
     if (s_T > 0 || s_Tc > 0)
     {
-        dali_set_brightness(LIGHT_MAX);
+        dali_fade_up(s_last_speed > 0.0f ? s_last_speed : 50.0f);
         if (s_state != STATE_SAFE_MODE &&
             s_state != STATE_AUTONOMO  &&
             s_state != STATE_MASTER)
@@ -437,7 +529,7 @@ static void _aplicar_brilho(void)
     }
     else
     {
-        dali_set_brightness(LIGHT_MIN);
+        dali_fade_down();
         if (s_state == STATE_LIGHT_ON)
             s_state = STATE_IDLE;
         s_last_speed = 0.0f;
@@ -468,12 +560,13 @@ const char *state_machine_get_state_name(void)
 {
     switch (s_state)
     {
-        case STATE_IDLE:      return "IDLE";
-        case STATE_LIGHT_ON:  return "LIGHT ON";
-        case STATE_SAFE_MODE: return "SAFE MODE";
-        case STATE_MASTER:    return "MASTER";
-        case STATE_AUTONOMO:  return "AUTONOMO";
-        default:              return "---";
+        case STATE_IDLE:       return "IDLE";
+        case STATE_LIGHT_ON:   return "LIGHT ON";
+        case STATE_SAFE_MODE:  return "SAFE MODE";
+        case STATE_MASTER:     return "MASTER";
+        case STATE_AUTONOMO:   return "AUTONOMO";
+        case STATE_OBSTACULO:  return "OBSTACULO";  /* v2.8 */
+        default:               return "---";
     }
 }
 
@@ -498,6 +591,9 @@ void state_machine_init(void)
     s_acender_em_ms    = 0;
     s_master_claim_ms  = 0;
     s_veiculo_presente = false;
+    /* v2.8 */
+    s_radar_degradado     = false;
+    s_obstaculo_clear_cnt = 0;
 
     dali_set_brightness(LIGHT_MIN);
     ESP_LOGI(TAG, "FSM v2.6 iniciada | IDLE | %d%%", LIGHT_MIN);
@@ -530,18 +626,30 @@ void state_machine_init(void)
 ============================================================ */
 void sm_on_radar_detect(float vel)
 {
-    s_acender_em_ms  = 0;
+    s_acender_em_ms  = 0;   /* cancela timer de pré-acendimento */
     s_apagar_pend    = false;
     s_last_detect_ms = _agora_ms();
     s_last_speed     = vel;
     s_radar_ok_cnt   = RADAR_OK_COUNT;
 
-    /* Converte Tc->T */
-    s_Tc = 0;
-    s_acender_em_ms = 0;
+    /*
+     * CORRECCAO 1 (v2.7): Tc-- em vez de Tc = 0.
+     *
+     * Antes: s_Tc = 0  — apagava TODOS os carros a caminho.
+     * Com Tc=2 (dois carros em cadeia), quando o primeiro chegava,
+     * o segundo era esquecido e nunca ia acender a luz.
+     *
+     * Agora: decrementa apenas 1 Tc — preserva os restantes.
+     * Guarda: nao desce abaixo de zero.
+     *
+     * Nota: s_acender_em_ms ja foi limpo na linha acima (uma vez,
+     * sem duplicacao — CORRECCAO 3).
+     */
+    if (s_Tc > 0) s_Tc--;
+
     if (s_T < MAX_RADAR_TARGETS) s_T++;
 
-    dali_set_brightness(LIGHT_MAX);
+    dali_fade_up(vel);
     if (s_state == STATE_IDLE)
         s_state = STATE_LIGHT_ON;
 
@@ -672,7 +780,19 @@ void on_prev_passed_received(void)
     bool tinha_Tc = (s_Tc > 0);
 
     if (s_T  > 0) s_T--;
-    s_Tc = 0;
+
+    /*
+     * CORRECCAO 2 (v2.7): Tc-- em vez de Tc = 0.
+     *
+     * Quando o poste seguinte confirma a chegada de um carro,
+     * decrementamos apenas 1 Tc — se havia dois carros a caminho
+     * (Tc=2) e um chegou ao poste seguinte, o segundo continua
+     * registado neste poste.
+     *
+     * Antes: s_Tc = 0 — apagava todos os carros a caminho.
+     */
+    if (s_Tc > 0) s_Tc--;
+
     s_acender_em_ms = 0;
 
     ESP_LOGI(TAG, "----------------------------------------");
@@ -753,7 +873,7 @@ void on_spd_received(float speed, uint32_t eta_ms)
          * acende imediatamente sem agendar timer.
          */
         s_acender_em_ms = 0;
-        dali_set_brightness(LIGHT_MAX);
+        dali_fade_up(speed);
         if (s_state != STATE_MASTER)
             s_state = STATE_LIGHT_ON;
 
@@ -810,10 +930,9 @@ static void _verificar_radar(bool teve_detecao)
         if (!s_radar_ok && s_radar_ok_cnt >= RADAR_OK_COUNT)
         {
             s_radar_ok = true;
+            s_state    = STATE_IDLE;   /* limpa SAFE_MODE antes de _aplicar_brilho */
             ESP_LOGI(TAG, "Radar recuperado - saindo de SAFE_MODE");
-
-            if (s_state == STATE_SAFE_MODE)
-                _aplicar_brilho();
+            _aplicar_brilho();
         }
     }
     else
@@ -916,19 +1035,25 @@ static void _verificar_vizinho_esquerdo(bool comm_ok, bool is_master)
 void state_machine_update(bool comm_ok, bool is_master)
 {
     /* ----------------------------------------------------------
-       1+2. Le radar e verifica saude
+       1+2. Lê radar e verifica saúde
     ---------------------------------------------------------- */
-    bool teve_detecao = false;
+    /*
+     * teve_frame = "recebemos um frame válido do sensor"
+     * Renomeado de teve_detecao (v2.7): true mesmo com count=0
+     * (zona vazia, sem alvos) — não significa "detectou veículo".
+     * Passado a _verificar_radar() para monitorizar saúde do sensor.
+     */
+    bool teve_frame = false;
+    radar_data_t dados = {0};
 
 #if USE_RADAR
-    radar_data_t dados;
-    teve_detecao = radar_read_data(&dados, NULL);
+    teve_frame = radar_read_data(&dados, NULL);
 
     /* Debounce: só dispara sm_on_radar_detect na transição
-     * ausente→presente (rising edge). Sem isto, cada ciclo de
-     * 100ms com veículo no campo enviava TC_INC ao poste direito
-     * e PASSED ao esquerdo, corrompendo os contadores T/Tc.   */
-    bool veiculo_agora = teve_detecao && radar_vehicle_in_range(&dados);
+     * ausente→presente (rising edge).
+     * radar_vehicle_in_range() já filtra por direcção (v3.0):
+     * só devolve true se o alvo se está a APROXIMAR. */
+    bool veiculo_agora = teve_frame && radar_vehicle_in_range(&dados);
     if (veiculo_agora && !s_veiculo_presente)
     {
         float vel = radar_get_closest_speed(&dados);
@@ -937,26 +1062,179 @@ void state_machine_update(bool comm_ok, bool is_master)
     s_veiculo_presente = veiculo_agora;
 #else
     _sim_update();
-    teve_detecao = false; /* simulado - saude sempre OK */
+    teve_frame = false; /* simulado — saúde sempre OK */
 #endif
 
-    _verificar_radar(teve_detecao);
+    _verificar_radar(teve_frame);
 
     /* ----------------------------------------------------------
-       3. SAFE_MODE: radar falhou
+       3. Gestão de falha do radar (CORRECÇÃO A + B — v2.8)
+       ----------------------------------------------------------
+       ANTES (bug): radar falha → SAFE_MODE + return imediato.
+         O return impedia os passos 6-11, incluindo o ETA por UDP.
+         O carro passava no escuro mesmo com o UDP a funcionar.
+
+       AGORA (correcto):
+         Se radar falha MAS comm_ok E Tc>0:
+           → modo degradado: usa apenas ETA por UDP para acender.
+           → NÃO entra em SAFE_MODE, NÃO faz return.
+           → s_radar_degradado = true (para log e display).
+
+         SAFE_MODE só activa quando radar E UDP falham:
+           → radar falhou E (!comm_ok OU Tc==0 sem expectativa)
+           → luz 50% fixo, return para não processar UDP inexistente.
+
+         CORRECÇÃO B: transição SAFE_MODE → AUTONOMO
+           Se em SAFE_MODE e o UDP também falha definitivamente,
+           o passo 10 (AUTONOMO) trata a transição correctamente.
     ---------------------------------------------------------- */
     if (!s_radar_ok)
     {
-        if (s_state != STATE_SAFE_MODE)
+        if (comm_ok && s_Tc > 0)
         {
-            s_state = STATE_SAFE_MODE;
-            dali_set_brightness(LIGHT_SAFE_MODE);
-            s_acender_em_ms = 0;   /* cancela timer */
-            ESP_LOGW(TAG, "SAFE_MODE - luz %d%%", LIGHT_SAFE_MODE);
-            comm_send_status(NEIGHBOR_SAFE);
+            /*
+             * Modo degradado: radar falhou mas há carro anunciado
+             * via UDP. Usa ETA por UDP — não interrompe o update.
+             * Regista estado para log e display.
+             */
+            if (!s_radar_degradado)
+            {
+                s_radar_degradado = true;
+                ESP_LOGW(TAG, "Radar FAIL mas UDP ok — modo degradado"
+                              " | ETA por UDP activo | Tc=%d", s_Tc);
+            }
+            /* Continua para os passos seguintes (ETA, timeouts, etc.) */
         }
-        return;
+        else if (comm_ok && s_Tc == 0 && !s_radar_degradado)
+        {
+            /*
+             * Radar falhou, UDP funciona mas não há carro anunciado.
+             * Entra em SAFE_MODE — sem informação de nenhuma fonte.
+             */
+            if (s_state != STATE_SAFE_MODE &&
+                s_state != STATE_OBSTACULO)
+            {
+                s_state = STATE_SAFE_MODE;
+                dali_set_brightness(LIGHT_SAFE_MODE);
+                s_acender_em_ms = 0;
+                ESP_LOGW(TAG, "SAFE_MODE — radar FAIL, sem Tc | luz %d%%",
+                         LIGHT_SAFE_MODE);
+                comm_send_status(NEIGHBOR_SAFE);
+            }
+            return;
+        }
+        else if (!comm_ok)
+        {
+            /*
+             * Radar falhou E UDP também falhou.
+             * SAFE_MODE definitivo — sem qualquer fonte de informação.
+             */
+            if (s_state != STATE_SAFE_MODE &&
+                s_state != STATE_OBSTACULO)
+            {
+                s_state = STATE_SAFE_MODE;
+                dali_set_brightness(LIGHT_SAFE_MODE);
+                s_acender_em_ms = 0;
+                ESP_LOGW(TAG, "SAFE_MODE — radar FAIL + UDP FAIL | luz %d%%",
+                         LIGHT_SAFE_MODE);
+            }
+            return;
+        }
     }
+    else
+    {
+        /* Radar recuperou — limpa flag de modo degradado */
+        if (s_radar_degradado)
+        {
+            s_radar_degradado = false;
+            ESP_LOGI(TAG, "Radar recuperado — saindo de modo degradado");
+
+            /*
+             * CORRECÇÃO C: recuperação do radar com Tc>0.
+             * Antes: _aplicar_brilho() acendia imediatamente a 100%.
+             * O carro pode já ter passado durante a falha do radar.
+             * Agora: se Tc>0, re-agenda o ETA com base no tempo
+             * decorrido desde que o TC_INC foi recebido.
+             * Se o Tc timeout já expirou, _agendar_apagar() trata.
+             */
+            if (s_Tc > 0 && s_tc_timeout_ms > 0)
+            {
+                uint64_t agora   = _agora_ms();
+                uint64_t restante = (s_tc_timeout_ms > agora)
+                                    ? (s_tc_timeout_ms - agora) / 2
+                                    : 0;
+                if (restante > MARGEM_ACENDER_MS)
+                {
+                    s_acender_em_ms = agora + restante - MARGEM_ACENDER_MS;
+                    ESP_LOGI(TAG, "Radar recuperado: re-agenda ETA em %llums",
+                             restante - MARGEM_ACENDER_MS);
+                }
+                else
+                {
+                    /* Carro já deve estar próximo — acende já */
+                    dali_fade_up(s_last_speed > 0.0f ? s_last_speed : 50.0f);
+                    if (s_state != STATE_MASTER)
+                        s_state = STATE_LIGHT_ON;
+                }
+            }
+            else if (s_state == STATE_SAFE_MODE)
+            {
+                s_state = STATE_IDLE;
+                _aplicar_brilho();
+            }
+        }
+    }
+
+    /* ----------------------------------------------------------
+       3b. STATE_OBSTACULO — detecção e saída (ADIÇÃO D — v2.8)
+       ----------------------------------------------------------
+       Condição de entrada:
+         radar_static_object_present() → alvo parado 8s+
+         Não activa se já em SAFE_MODE ou AUTONOMO.
+
+       Comportamento:
+         Luz 100% contínuo — sinalização de perigo.
+         Envia STATUS:OBST aos vizinhos — eles também acendem.
+         Timeout normal de apagamento NÃO actua em OBSTACULO.
+
+       Condição de saída:
+         count==0 por OBSTACULO_CLEAR_FRAMES (1 segundo).
+         Volta a IDLE, envia STATUS:OK.
+    ---------------------------------------------------------- */
+#if USE_RADAR
+    if (s_state == STATE_OBSTACULO)
+    {
+        /* Verifica se o obstáculo desapareceu */
+        if (dados.count == 0)
+        {
+            s_obstaculo_clear_cnt++;
+            if (s_obstaculo_clear_cnt >= OBSTACULO_CLEAR_FRAMES)
+            {
+                s_obstaculo_clear_cnt = 0;
+                s_state               = STATE_IDLE;
+                _aplicar_brilho();
+                ESP_LOGI(TAG, "Obstáculo removido — volta a IDLE");
+                if (comm_ok) comm_send_status(NEIGHBOR_OK);
+            }
+        }
+        else
+        {
+            s_obstaculo_clear_cnt = 0; /* obstáculo ainda presente */
+        }
+        /* Em OBSTACULO o update continua — permite processar UDP */
+    }
+    else if (s_state != STATE_SAFE_MODE  &&
+             s_state != STATE_AUTONOMO   &&
+             radar_static_object_present(&dados))
+    {
+        /* Novo obstáculo detectado */
+        s_state               = STATE_OBSTACULO;
+        s_obstaculo_clear_cnt = 0;
+        dali_set_brightness(LIGHT_MAX);
+        ESP_LOGW(TAG, "OBSTACULO detectado — luz 100%% | sinalizar vizinhos");
+        if (comm_ok) comm_send_status(NEIGHBOR_OBSTACULO);
+    }
+#endif
 
     /* ----------------------------------------------------------
        4. Estado do vizinho direito
@@ -985,7 +1263,7 @@ void state_machine_update(bool comm_ok, bool is_master)
 
         if (s_Tc > 0)
         {
-            dali_set_brightness(LIGHT_MAX);
+            dali_fade_up(s_last_speed > 0.0f ? s_last_speed : 50.0f);
             if (s_state != STATE_MASTER)
                 s_state = STATE_LIGHT_ON;
 
@@ -1046,7 +1324,7 @@ void state_machine_update(bool comm_ok, bool is_master)
         uint64_t espera = _agora_ms() - s_last_detect_ms;
         if (espera >= 1000ULL)
         {
-            dali_set_brightness(LIGHT_MAX);
+            dali_fade_up(s_last_speed > 0.0f ? s_last_speed : 50.0f);
             if (s_state != STATE_MASTER)
                 s_state = STATE_LIGHT_ON;
 
@@ -1055,17 +1333,26 @@ void state_machine_update(bool comm_ok, bool is_master)
     }
 
     /* ----------------------------------------------------------
-       10. AUTONOMO <-> normal
+       10. AUTONOMO ↔ normal  (CORRECÇÃO B — v2.8)
+       ----------------------------------------------------------
+       CORRECÇÃO B: SAFE_MODE → AUTONOMO quando UDP também falha.
+       Antes: o passo 10 ignorava SAFE_MODE (não transitava).
+       Agora: se em SAFE_MODE e !comm_ok, transita para AUTONOMO
+       para que o radar local (quando recuperar) assuma controlo.
+
+       STATE_OBSTACULO não transita para AUTONOMO — o obstáculo
+       é uma condição activa que requer sinalização contínua.
     ---------------------------------------------------------- */
     if (!comm_ok)
     {
-        if (s_state != STATE_AUTONOMO &&
-            s_state != STATE_SAFE_MODE)
+        if (s_state != STATE_AUTONOMO   &&
+            s_state != STATE_OBSTACULO)
         {
             if (s_T == 0 && s_Tc == 0)
             {
                 s_state         = STATE_AUTONOMO;
                 s_acender_em_ms = 0;
+                s_radar_degradado = false;
                 ESP_LOGW(TAG, "Sem UDP -> AUTONOMO");
             }
         }
@@ -1120,8 +1407,9 @@ void state_machine_update(bool comm_ok, bool is_master)
    GETTERS
 ============================================================ */
 
-system_state_t state_machine_get_state(void)   { return s_state; }
-int            state_machine_get_T(void)        { return s_T; }
-int            state_machine_get_Tc(void)       { return s_Tc; }
+system_state_t state_machine_get_state(void)     { return s_state; }
+int            state_machine_get_T(void)          { return s_T; }
+int            state_machine_get_Tc(void)         { return s_Tc; }
 float          state_machine_get_last_speed(void) { return s_last_speed; }
-bool           state_machine_radar_ok(void)     { return s_radar_ok; }
+bool           state_machine_radar_ok(void)       { return s_radar_ok; }
+bool           sm_is_obstaculo(void)              { return s_state == STATE_OBSTACULO; }

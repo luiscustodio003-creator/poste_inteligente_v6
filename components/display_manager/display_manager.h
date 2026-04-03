@@ -113,6 +113,15 @@ void display_manager_tick(uint32_t ms);
  */
 void display_manager_task(void);
 
+/**
+ * @brief Limpa todo o estado de interpolação do radar.
+ *        Chamar quando o radar reinicia ou perde tracking.
+ *        Seguro chamar a qualquer momento após init().
+ */
+void display_manager_reset_radar(void);
+
+
+
 /* ============================================================
    FUNÇÕES DE ACTUALIZAÇÃO DE ESTADO
 ============================================================ */
@@ -170,10 +179,8 @@ void display_manager_set_speed(int speed);
  * @param leftOk  true se vizinho esquerdo está a responder.
  * @param rightOk true se vizinho direito está a responder.
  */
-void display_manager_set_neighbors(const char *nebL,
-                                   const char *nebR,
-                                   bool        leftOk,
-                                   bool        rightOk);
+void display_manager_set_neighbors(const char *nebL,const char *nebR,
+                                   bool leftOk, bool rightOk);
 
 /**
  * @brief Actualiza o canvas do radar com os objectos detectados.

@@ -1,35 +1,37 @@
 ================================================================================
- MÓDULO: udp_manager
- VERSÃO: 3.0
- DATA  : 2026-03-20
- AUTORES: Luis Custodio | Tiago Moreno
+MODULO: udp_manager
+VERSAO: 3.3 | DATA: 2026-03-25
+PROJECTO: Poste Inteligente v6
+AUTORES: Luis Custodio | Tiago Moreno
 ================================================================================
 
-DESCRIÇÃO
+DESCRICAO
 ---------
-Gere toda a comunicação UDP entre postes da cadeia inteligente.
-Implementa descoberta automática de vizinhos e o protocolo completo
-de mensagens para coordenação de tráfego e gestão de falhas.
-
+Gere toda a comunicacao UDP entre postes da cadeia inteligente.
+Implementa descoberta automatica de vizinhos e o protocolo completo
+de mensagens para coordenacao de trafego e gestao de falhas.
+Corre uma task dedicada (udp_task) para recepcao assincrona de mensagens.
 
 PROTOCOLO DE MENSAGENS
 -----------------------
-Todas as mensagens são texto simples separado por ':'.
-Porto: UDP_PORT (definido em system_config.h, por omissão 5005).
+  Todas as mensagens sao texto simples separado por ':'.
+  Porto: UDP_PORT (definido em system_config.h, por omissao 5005).
+  Envio: unicast para IP especifico (exceto DISCOVER = broadcast).
 
   DISCOVER:<id>
-      Broadcast periódico. Todos os postes actualizam a tabela
-      de vizinhos ao receber. Resposta automática com STATUS:OK.
-      Intervalo: DISCOVER_INTERVAL_MS (system_config.h)
+      Broadcast periodico (DISCOVER_INTERVAL_MS).
+      Todos os postes actualizam tabela de vizinhos ao receber.
+      Resposta automatica: STATUS:OK ao remetente.
 
   SPD:<id>:<vel>:<eta_ms>:<dist_m>
-      Enviado ao vizinho direito quando radar detecta carro.
-      O ETA (ms) permite ao vizinho acender no momento exacto.
+      Enviado ao vizinho direito apos deteccao de veiculo.
+      vel     : velocidade em km/h
+      eta_ms  : tempo estimado de chegada ao proximo poste (ms)
+      dist_m  : distancia entre postes (metros)
 
   TC_INC:<id>:<vel>
-      Enviado ao vizinho direito imediatamente após detecção.
-      vel > 0 → carro a caminho (Tc++)
-      vel < 0 → carro passou    (T--)
+      Enviado ao vizinho direito imediatamente apos deteccao.
+      Activa on_tc_inc_received() no receptor -> Tc++
 
   STATUS:<id>:<estado>
       Propaga estado: OK | FAIL | SAFE | AUTO | OFFLINE
@@ -37,108 +39,92 @@ Porto: UDP_PORT (definido em system_config.h, por omissão 5005).
 
   MASTER_CLAIM:<id>
       Enviado pelo poste pos=0 ao voltar online.
-      O vizinho direito cede liderança e propaga em cadeia.
-
-
-FUNÇÕES PÚBLICAS
-----------------
-
-  udp_manager_init()
-      Cria socket, activa broadcast, faz bind e arranca task UDP.
-      Chamar UMA VEZ após Wi-Fi com IP obtido.
-      Retorna false se o socket falhar.
-
-  udp_manager_discover()
-      Envia DISCOVER broadcast manualmente.
-      A task interna já chama periodicamente — uso opcional.
-
-  udp_manager_send_spd(ip, speed, eta_ms, dist_m)
-      Envia SPD a um IP específico.
-
-  udp_manager_send_tc_inc(ip, speed)
-      Envia TC_INC. speed negativa = sinal de T--.
-
-  udp_manager_send_status(ip, status)
-      Envia STATUS com enum neighbor_status_t.
-
-  udp_manager_send_master_claim(ip)
-      Envia MASTER_CLAIM a um IP específico.
-
-  udp_manager_get_neighbors(nebL, nebR)
-      Preenche buffers com IP dos vizinhos esq/dir.
-      "---" se não houver vizinho conhecido.
-      Compatível com main.c v2.4.
-
-  udp_manager_get_neighbor_by_pos(position)
-      Devolve ponteiro para neighbor_t com aquela posição.
-      NULL se não encontrado. Usado pelo comm_manager.
-
-  udp_manager_get_all_neighbors(list, max)
-      Copia todos os vizinhos activos para o array.
-      Devolve número de entradas copiadas.
-
+      Receptor cede lideranca e propaga em cadeia para a direita.
 
 CALLBACKS (implementar em state_machine.c)
 ------------------------------------------
-Estas funções são declaradas __attribute__((weak)) no udp_manager.c.
-A state_machine.c deve definir as versões reais:
+  Declarados __attribute__((weak)) -- a state_machine.c define as versoes reais.
 
   void on_tc_inc_received(float speed)
-      Chamado ao receber TC_INC com speed > 0 (Tc++)
+      Chamado ao receber TC_INC. speed > 0 = carro a caminho (Tc++)
 
   void on_prev_passed_received(void)
-      Chamado ao receber TC_INC com speed < 0 (T--)
+      Chamado ao receber notificacao de carro passou (T--)
 
   void on_spd_received(float speed, uint32_t eta_ms)
-      Chamado ao receber SPD
+      Chamado ao receber SPD -- agenda pre-acendimento
 
   void on_master_claim_received(int from_id)
-      Chamado ao receber MASTER_CLAIM
-
+      Chamado ao receber MASTER_CLAIM -- cede lideranca
 
 ESTRUTURA neighbor_t
 ---------------------
-  char              ip[16]      IP do vizinho "x.x.x.x"
-  int               id          ID do poste vizinho
-  int               position    Posição na cadeia
-  neighbor_status_t status      OK / OFFLINE / FAIL / SAFE / AUTO
-  bool              active      true se entrada válida
-  uint32_t          last_seen   Timestamp última recepção (ms)
+  char              ip[MAX_IP_LEN]   IP do vizinho "x.x.x.x\0"
+  int               id               ID do poste vizinho
+  int               position         Posicao na cadeia
+  neighbor_status_t status           OK/OFFLINE/FAIL/SAFE/AUTO
+  bool              active           true se entrada valida
+  bool              discover_ok      true se ja respondeu a DISCOVER
+  uint32_t          last_seen        Timestamp ultima recepcao (ms)
 
+ENUM neighbor_status_t
+------------------------
+  NEIGHBOR_OK       -- poste a responder normalmente
+  NEIGHBOR_OFFLINE  -- timeout (NEIGHBOR_TIMEOUT_MS sem mensagem)
+  NEIGHBOR_FAIL     -- reportou falha de hardware
+  NEIGHBOR_SAFE     -- em SAFE_MODE (radar falhou)
+  NEIGHBOR_AUTO     -- em modo AUTONOMO (UDP falhou nesse poste)
 
-DEPENDÊNCIAS
-------------
-  system_config.h  UDP_PORT, MAX_NEIGHBORS, DISCOVER_INTERVAL_MS,
-                   NEIGHBOR_TIMEOUT_MS, POSTE_ID, POST_POSITION
-  lwip             sockets UDP
-  esp_timer        timestamps
-  freertos         task UDP
+API PUBLICA
+-----------
+  bool      udp_manager_init(void)
+  void      udp_manager_discover(void)
+  bool      udp_manager_send_spd(ip, speed, eta_ms, dist_m)
+  bool      udp_manager_send_tc_inc(ip, speed)
+  bool      udp_manager_send_status(ip, status)
+  bool      udp_manager_send_master_claim(ip)
+  void      udp_manager_get_neighbors(nebL, nebR)
+  neighbor_t *udp_manager_get_neighbor_by_pos(int position)
+  size_t    udp_manager_get_all_neighbors(list, max)
 
+TIMINGS CRITICOS (system_config.h)
+------------------------------------
+  NEIGHBOR_TIMEOUT_MS    8000  -- sem mensagem -> vizinho OFFLINE
+  DISCOVER_INTERVAL_MS   2000  -- intervalo entre broadcasts DISCOVER
+  ACK_TIMEOUT_MS          500  -- timeout espera ACK (nao usado actualmente)
 
 COMO TESTAR (2 ESP32 na mesma rede)
 -------------------------------------
-  1. Flashar POSTE_ID=1 num ESP32 e POSTE_ID=2 noutro
-  2. Ligar os dois à mesma rede Wi-Fi
-  3. Abrir monitor série em ambos
-  4. Após ~5s deves ver nos logs:
-       [UDP_MGR] DISCOVER ID=2 IP=192.168.x.x [DIR]   (no poste 1)
-       [UDP_MGR] DISCOVER ID=1 IP=192.168.x.x [ESQ]   (no poste 2)
-  5. No display de cada poste, a zona de vizinhos fica azul "OK"
-  6. Para testar TC_INC: descomentar bloco de teste no main.c
+  1. Flashar POSTE_ID=1, POST_POSITION=0 num ESP32
+  2. Flashar POSTE_ID=2, POST_POSITION=1 noutro ESP32
+  3. Ligar os dois a mesma rede Wi-Fi
+  4. Apos ~5s nos logs de cada poste:
+       [UDP_MGR] DISCOVER ID=2 IP=x.x.x.x [DIR]    (no poste 1)
+       [UDP_MGR] DISCOVER ID=1 IP=x.x.x.x [ESQ]    (no poste 2)
+  5. No display: zona vizinhos fica verde
 
+DEPENDENCIAS
+------------
+  system_config.h  -- UDP_PORT, MAX_NEIGHBORS, DISCOVER_INTERVAL_MS,
+                      NEIGHBOR_TIMEOUT_MS, POSTE_ID, POST_POSITION, MAX_IP_LEN
+  lwip/sockets.h   -- sockets UDP BSD (lwIP stack do ESP-IDF)
+  esp_timer.h      -- timestamps
+  freertos/task.h  -- task UDP dedicada
 
-ALTERAÇÕES v2.1 → v3.0
-------------------------
-  + neighbor_t expandido: .id, .position, .status, .active
-  + udp_manager_init() retorna bool (era void)
-  + udp_manager_discover() exposta publicamente
-  + udp_manager_send_spd() — nova
-  + udp_manager_send_tc_inc() — nova
-  + udp_manager_send_status() — nova
-  + udp_manager_send_master_claim() — nova
-  + udp_manager_get_neighbor_by_pos() — nova
-  + udp_manager_get_all_neighbors() — nova
-  + Callbacks weak: on_tc_inc_received, on_prev_passed_received,
-                    on_spd_received, on_master_claim_received
-  + neighbor_status_t definida neste módulo
+REFERENCIAS
+-----------
+  ESP-IDF Sockets (lwIP):
+    https://docs.espressif.com/projects/esp-idf/en/latest/esp32/api-guides/lwip.html
+
+  ESP-IDF UDP Socket exemplo:
+    https://github.com/espressif/esp-idf/tree/master/examples/protocols/sockets/udp_server
+
+  lwIP documentacao:
+    https://www.nongnu.org/lwip/2_1_x/group__socket.html
+
+  YouTube - UDP Communication ESP32:
+    Pesquisar "ESP32 UDP socket ESP-IDF" no YouTube
+
+  YouTube - Espressif Networking:
+    https://www.youtube.com/@EspressifSystems
 ================================================================================

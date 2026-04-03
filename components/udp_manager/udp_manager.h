@@ -3,12 +3,22 @@
    ------------------------------------------------------------
    @file      udp_manager.h
    @brief     Comunicação UDP entre postes — protocolo completo
-   @version   3.0
-   @date      2026-03-20
+   @version   3.1
+   @date      2026-04-01
 
    Projecto  : Poste Inteligente
    Estudantes: Luis Custodio | Tiago Moreno
    Plataforma: ESP32 (ESP-IDF)
+
+   Alterações v3.0 → v3.1:
+   ------------------------
+   ADIÇÃO — NEIGHBOR_OBSTACULO adicionado a neighbor_status_t.
+     Novo estado propagado via STATUS:OBST quando um poste detecta
+     um obstáculo estático persistente (carro em avaria, objecto
+     de grande reflectividade imóvel durante OBSTACULO_TIMEOUT_MS).
+     Os vizinhos que recebem este status acendem a 100% como forma
+     de sinalização de perigo na cadeia.
+     Protocolo: STATUS:<id>:OBST
 
    Descrição:
    ----------
@@ -75,11 +85,15 @@
    ESTADO DO VIZINHO
 ============================================================ */
 typedef enum {
-    NEIGHBOR_OK      = 0,   /* Online e a responder          */
-    NEIGHBOR_OFFLINE = 1,   /* Sem resposta > NEIGHBOR_TIMEOUT_MS */
-    NEIGHBOR_FAIL    = 2,   /* Reportou falha via STATUS     */
-    NEIGHBOR_SAFE    = 3,   /* Em modo seguro (radar falhou) */
-    NEIGHBOR_AUTO    = 4,   /* Em modo autónomo (sem UDP)    */
+    NEIGHBOR_OK        = 0,   /* Online e a responder              */
+    NEIGHBOR_OFFLINE   = 1,   /* Sem resposta > NEIGHBOR_TIMEOUT_MS */
+    NEIGHBOR_FAIL      = 2,   /* Reportou falha via STATUS         */
+    NEIGHBOR_SAFE      = 3,   /* Em modo seguro (radar falhou)     */
+    NEIGHBOR_AUTO      = 4,   /* Em modo autónomo (sem UDP)        */
+    NEIGHBOR_OBSTACULO = 5,   /* Obstáculo estático detectado (v3.1)
+                                 Carro em avaria ou objecto grande
+                                 imóvel no campo do radar.
+                                 Propaga sinalização a toda a cadeia. */
 } neighbor_status_t;
 
 /* ============================================================

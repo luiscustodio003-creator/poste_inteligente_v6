@@ -3,8 +3,8 @@
    ------------------------------------------------------------
    @file      state_machine.h
    @brief     Máquina de estados do Poste Inteligente
-   @version   2.9
-   @date      2026-03-25
+   @version   2.8
+   @date      2026-04-01
 
    Projecto  : Poste Inteligente
    Estudantes: Luis Custodio | Tiago Moreno
@@ -19,48 +19,48 @@
    --------
      IDLE        T=0, Tc=0 — repouso, luz 10%
      LIGHT_ON    T>0 ou Tc>0 — luz 100%
-     SAFE_MODE   Radar falhou — luz 50% fixo
+     SAFE_MODE   Radar falhou E UDP falhou — luz 50% fixo
      MASTER      Líder da cadeia (viz. esq offline ou pos=0)
      AUTONOMO    Sem UDP — radar local assume comando
+     OBSTACULO   Obstáculo estático persistente detectado (v2.8)
+                 luz 100% contínuo, sinalização UDP a vizinhos
 
    Contadores:
    -----------
      T  = carros presentes (radar local confirmou)
      Tc = carros a caminho (UDP anunciou, ainda não chegaram)
-     Luz 100% quando T>0 OU Tc>0
+     Luz 100% quando T>0 OU Tc>0 OU STATE_OBSTACULO
      Luz 10%  quando T=0 E Tc=0 (após TRAFIC_TIMEOUT_MS)
 
-   Cenários de falha tratados:
-   ---------------------------
-   1. Radar falha           → AUTONOMO (usa radar local)
-   2. Radar + local falham  → SAFE_MODE (50% fixo)
-   3. Poste seguinte OFF    → Tc vai a zeros imediatamente
-   4. Poste anterior OFF    → T limpo após T_STUCK_TIMEOUT_MS
-   5. Sem vizinho esquerdo  → promove-se a MASTER
-   6. pos=0 volta online    → MASTER_CLAIM em cadeia
-   7. Radar recupera        → sai de SAFE_MODE para IDLE
-   8. UDP recupera          → sai de AUTONOMO para estado anterior
+   Cenários de falha tratados (v2.8):
+   -----------------------------------
+   1. Radar falha mas UDP ok    → ignora radar, usa ETA por UDP
+   2. Radar falha E UDP falha   → SAFE_MODE (50% fixo)
+   3. Poste seguinte OFF        → Tc vai a zeros imediatamente
+   4. Poste anterior OFF        → T limpo após T_STUCK_TIMEOUT_MS
+   5. Sem vizinho esquerdo      → promove-se a MASTER
+   6. pos=0 volta online        → MASTER_CLAIM em cadeia
+   7. Radar recupera            → sai de SAFE_MODE/degradado para IDLE
+   8. UDP recupera              → sai de AUTONOMO para estado anterior
+   9. Obstáculo estático 8s+    → STATE_OBSTACULO, luz 100%, UDP OBST
+  10. Obstáculo desaparece      → volta a IDLE
 
-   Callbacks UDP (implementados aqui, declarados como weak
-   no udp_manager):
-   ---------------------------------------------------------
-     on_tc_inc_received()     → Tc++, acende 100%, propaga em cadeia
-     on_prev_passed_received()→ T--
-     on_spd_received()        → guarda velocidade, refina timeout Tc com ETA
-     on_master_claim_received()→ cede liderança
-
-   Alterações v2.0 → v2.3:
+   Alterações v2.7 → v2.8:
    ------------------------
-   1. on_tc_inc_received() propaga TC_INC ao vizinho direito
-   2. on_spd_received() usa ETA para refinar timeout Tc
-   3. Timeout Tc (TC_TIMEOUT_MS) adicionado — evita Tc preso
-   4. MASTER preservado em _aplicar_brilho e sm_on_radar_detect
+   1. STATE_OBSTACULO adicionado ao enum.
+   2. SAFE_MODE corrigido: só activa quando radar E UDP falham.
+      Antes: radar falha → SAFE_MODE (ignorava UDP).
+      Agora: radar falha mas UDP ok → processa ETA normalmente.
+   3. Transição SAFE_MODE → AUTONOMO quando UDP também falha.
+   4. Recuperação do radar com Tc>0 — re-agenda ETA em vez de
+      acender imediatamente (evita janela de luz sem carro).
+   5. sm_is_obstaculo() getter adicionado.
 
    Dependências:
    -------------
    - dali_manager.h  : controlo PWM da luminária
    - comm_manager.h  : envio de mensagens UDP
-   - radar_manager.h : leitura do sensor HLK-LD2450
+   - radar_manager.h : radar_read_data(), radar_static_object_present()
    - system_config.h : TRAFIC_TIMEOUT_MS, LIGHT_*, POST_POSITION
 
 ============================================================ */
@@ -75,11 +75,13 @@
    ESTADOS
 ============================================================ */
 typedef enum {
-    STATE_IDLE      = 0,  /* T=0 Tc=0 — repouso 10%              */
-    STATE_LIGHT_ON,       /* T>0 ou Tc>0 — luz 100%              */
-    STATE_SAFE_MODE,      /* Radar falhou — 50% fixo             */
-    STATE_MASTER,         /* Líder da cadeia                     */
-    STATE_AUTONOMO        /* Sem UDP — radar local assume         */
+    STATE_IDLE       = 0, /* T=0 Tc=0 — repouso 10%               */
+    STATE_LIGHT_ON,       /* T>0 ou Tc>0 — luz 100%               */
+    STATE_SAFE_MODE,      /* Radar E UDP falhou — 50% fixo         */
+    STATE_MASTER,         /* Líder da cadeia                       */
+    STATE_AUTONOMO,       /* Sem UDP — radar local assume          */
+    STATE_OBSTACULO       /* Obstáculo estático 8s+ — luz 100%     */
+                          /* Sinalização de perigo para vizinhos   */
 } system_state_t;
 
 /* ============================================================
@@ -177,10 +179,14 @@ float state_machine_get_last_speed(void);
 /** true se radar local está operacional */
 bool state_machine_radar_ok(void);
 
+/** true se poste está em STATE_OBSTACULO */
+bool sm_is_obstaculo(void);
+
 /* ============================================================
    SIMULADOR — apenas USE_RADAR=0
 ============================================================ */
 
+#if USE_RADAR == 0
 /**
  * @brief Lê posição actual do carro simulado para o canvas.
  *        Chamada pelo main.c a cada ciclo de 100ms.
@@ -195,10 +201,9 @@ bool sim_get_objeto(float *x_mm, float *y_mm);
  *        Chamada internamente por on_tc_inc_received().
  *        Activa o simulador local para mostrar o carro
  *        no canvas quando entrar no raio deste poste.
- *        Só relevante com USE_RADAR=0 (modo simulado).
- *        Com USE_RADAR=1 o radar físico detecta sozinho.
  * @param vel_kmh Velocidade do carro em km/h
  */
 void sim_notificar_chegada(float vel_kmh);
+#endif /* USE_RADAR == 0 */
 
 #endif /* STATE_MACHINE_H */
